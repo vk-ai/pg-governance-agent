@@ -35,7 +35,7 @@ async function main(): Promise<void> {
   }));
 
   server.setRequestHandler(CallToolRequestSchema, async (request) => {
-    const name: request.params.name;
+    const name = request.params.name;
     const args = (request.params.arguments || {}) as Record<string, unknown>;
     log("debug", "tool_call", { tool: name });
     return handleTool(ctx, name, args);
