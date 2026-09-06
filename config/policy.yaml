@@ -1,0 +1,102 @@
+# PgGuard RBAC policy — role selected via PGGUARD_ROLE
+version: 1
+defaults:
+  max_rows: 100
+  require_confirm_dml: true
+  require_confirm_ddl: true
+  allow_explain_analyze: false
+  audit_retention_days: 90
+
+blocked_patterns:
+  - multiple_statements
+  - copy
+  - into_outfile
+  - set_role
+  - set_session_authorization
+  - create_user
+  - alter_user
+  - drop_user
+  - grant
+  - revoke
+  - dangerous_functions
+
+dangerous_functions:
+  - pg_read_file
+  - pg_write_file
+  - pg_ls_dir
+  - lo_import
+  - lo_export
+  - dblink
+  - dblink_exec
+
+roles:
+  reader:
+    description: Read-only analyst / agent
+    db_user: app_reader
+    allow:
+      - health
+      - introspect
+      - select
+      - explain
+      - audit_read
+      - whoami
+    deny:
+      - dml
+      - ddl
+    max_rows: 100
+    allow_explain_analyze: false
+
+  writer:
+    description: Application writer — DML with confirmation
+    db_user: app_writer
+    allow:
+      - health
+      - introspect
+      - select
+      - dml
+      - explain
+      - audit_read
+      - whoami
+    deny:
+      - ddl
+    max_rows: 200
+    require_confirm_dml: true
+    allow_explain_analyze: false
+
+  migrator:
+    description: Schema migrator — DDL with dual-control confirmation
+    db_user: app_migrator
+    allow:
+      - health
+      - introspect
+      - select
+      - dml
+      - ddl
+      - explain
+      - audit_read
+      - whoami
+    deny: []
+    max_rows: 500
+    require_confirm_dml: true
+    require_confirm_ddl: true
+    allow_explain_analyze: true
+    dual_control_ddl: true
+
+  admin:
+    description: Break-glass admin (still audited; confirm required)
+    db_user: app_migrator
+    allow:
+      - health
+      - introspect
+      - select
+      - dml
+      - ddl
+      - explain
+      - audit_read
+      - whoami
+    deny: []
+    max_rows: 1000
+    require_confirm_dml: true
+    require_confirm_ddl: true
+    allow_explain_analyze: true
+    dual_control_ddl: true

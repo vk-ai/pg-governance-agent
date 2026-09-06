@@ -1,0 +1,20 @@
+{
+  "mcpServers": {
+    "pgguard": {
+      "command": "node",
+      "args": ["REPLACE_WITH_ABS_PATH/pg-governance-agent/dist/index.js"],
+      "env": {
+        "PGGUARD_ROLE": "reader",
+        "PGGUARD_SECRETS_PROVIDER": "env",
+        "PGGUARD_POLICY_PATH": "REPLACE_WITH_ABS_PATH/pg-governance-agent/config/policy.yaml",
+        "PGGUARD_AUDIT_DIR": "REPLACE_WITH_ABS_PATH/pg-governance-agent/data/audit",
+        "PGHOST": "127.0.0.1",
+        "PGPORT": "5432",
+        "PGDATABASE": "corpdb",
+        "PGUSER": "app_reader",
+        "PGPASSWORD": "reader_demo_pass",
+        "PGSSLMODE": "disable"
+      }
+    }
+  }
+}
