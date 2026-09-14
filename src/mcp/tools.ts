@@ -3,6 +3,11 @@ import type { AppContext } from "./context.js";
 import { credsForPolicy } from "./context.js";
 import { withClient } from "../db/pool.js";
 import {
+  resolvePrincipal,
+  gucsForPrincipal,
+  type Principal,
+} from "../auth/principal.js";
+import {
   ping,
   listSchemas,
   listTables,
@@ -30,16 +35,49 @@ function errResult(message: string) {
   };
 }
 
+const bearerTokenProp = {
+  bearer_token: {
+    type: "string" as const,
+    description:
+      "Optional end-user JWT (HS256). Sets RLS session GUCs via set_config. Or env PGGUARD_BEARER_TOKEN.",
+  },
+};
+
+function sessionOpts(ctx: AppContext, args: Record<string, unknown>): {
+  principal: Principal | null;
+  withOpts: { sessionGucs?: Record<string, string> };
+  principalSub?: string;
+} {
+  const principal = resolvePrincipal(args, ctx.policy.principalPropagation);
+  if (!principal) {
+    return { principal: null, withOpts: {} };
+  }
+  const sessionGucs = gucsForPrincipal(principal, ctx.policy.principalPropagation);
+  return {
+    principal,
+    withOpts: { sessionGucs },
+    principalSub: principal.sub,
+  };
+}
+
 export const toolDefs = [
   {
     name: "db_health",
     description: "Ping Postgres and return server version",
-    inputSchema: { type: "object" as const, properties: {}, additionalProperties: false },
+    inputSchema: {
+      type: "object" as const,
+      properties: { ...bearerTokenProp },
+      additionalProperties: false,
+    },
   },
   {
     name: "list_schemas",
     description: "List non-system schemas",
-    inputSchema: { type: "object" as const, properties: {}, additionalProperties: false },
+    inputSchema: {
+      type: "object" as const,
+      properties: { ...bearerTokenProp },
+      additionalProperties: false,
+    },
   },
   {
     name: "list_tables",
@@ -48,6 +86,7 @@ export const toolDefs = [
       type: "object" as const,
       properties: {
         schema: { type: "string", description: "Schema name (optional)" },
+        ...bearerTokenProp,
       },
       additionalProperties: false,
     },
@@ -60,6 +99,7 @@ export const toolDefs = [
       properties: {
         schema: { type: "string" },
         table: { type: "string" },
+        ...bearerTokenProp,
       },
       required: ["schema", "table"],
       additionalProperties: false,
@@ -73,6 +113,7 @@ export const toolDefs = [
       properties: {
         sql: { type: "string" },
         max_rows: { type: "number" },
+        ...bearerTokenProp,
       },
       required: ["sql"],
       additionalProperties: false,
@@ -86,6 +127,7 @@ export const toolDefs = [
       properties: {
         sql: { type: "string" },
         confirm: { type: "boolean" },
+        ...bearerTokenProp,
       },
       required: ["sql", "confirm"],
       additionalProperties: false,
@@ -100,6 +142,7 @@ export const toolDefs = [
         sql: { type: "string" },
         confirm: { type: "boolean" },
         dry_run: { type: "boolean" },
+        ...bearerTokenProp,
       },
       required: ["sql"],
       additionalProperties: false,
@@ -113,6 +156,7 @@ export const toolDefs = [
       properties: {
         sql: { type: "string" },
         analyze: { type: "boolean" },
+        ...bearerTokenProp,
       },
       required: ["sql"],
       additionalProperties: false,
@@ -131,8 +175,12 @@ export const toolDefs = [
   },
   {
     name: "whoami",
-    description: "Current agent role and effective policy",
-    inputSchema: { type: "object" as const, properties: {}, additionalProperties: false },
+    description: "Current agent role, effective policy, and optional JWT principal",
+    inputSchema: {
+      type: "object" as const,
+      properties: { ...bearerTokenProp },
+      additionalProperties: false,
+    },
   },
 ] as const;
 
@@ -146,33 +194,61 @@ export async function handleTool(
     switch (name) {
       case "db_health": {
         assertCapability(ctx.policy, "health");
+        const { principal, withOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const result = await withClient(creds, (c) => ping(c));
-        ctx.audit.append({ tool: name, role, ok: true, detail: { version: result.version } });
+        const result = await withClient(creds, (c) => ping(c), withOpts);
+        ctx.audit.append({
+          tool: name,
+          role,
+          principal: principalSub,
+          ok: true,
+          detail: { version: result.version },
+        });
         return textResult(result);
       }
       case "list_schemas": {
         assertCapability(ctx.policy, "introspect");
+        const { withOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const schemas = await withClient(creds, (c) => listSchemas(c));
-        ctx.audit.append({ tool: name, role, ok: true, detail: { count: schemas.length } });
+        const schemas = await withClient(creds, (c) => listSchemas(c), withOpts);
+        ctx.audit.append({
+          tool: name,
+          role,
+          principal: principalSub,
+          ok: true,
+          detail: { count: schemas.length },
+        });
         return textResult({ schemas });
       }
       case "list_tables": {
         assertCapability(ctx.policy, "introspect");
         const schema = typeof args.schema === "string" ? args.schema : undefined;
+        const { withOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const tables = await withClient(creds, (c) => listTables(c, schema));
-        ctx.audit.append({ tool: name, role, ok: true, detail: { count: tables.length, schema } });
+        const tables = await withClient(creds, (c) => listTables(c, schema), withOpts);
+        ctx.audit.append({
+          tool: name,
+          role,
+          principal: principalSub,
+          ok: true,
+          detail: { count: tables.length, schema },
+        });
         return textResult({ tables });
       }
       case "describe_table": {
         assertCapability(ctx.policy, "introspect");
         const schema = z.string().parse(args.schema);
         const table = z.string().parse(args.table);
+        const { withOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const columns = await withClient(creds, (c) => describeTable(c, schema, table));
-        ctx.audit.append({ tool: name, role, ok: true, detail: { schema, table } });
+        const columns = await withClient(creds, (c) => describeTable(c, schema, table), withOpts);
+        ctx.audit.append({
+          tool: name,
+          role,
+          principal: principalSub,
+          ok: true,
+          detail: { schema, table },
+        });
         return textResult({ schema, table, columns });
       }
       case "run_select": {
@@ -186,14 +262,20 @@ export async function handleTool(
           return errResult(msg);
         }
         const limited = enforceMaxRows(sql, maxRows);
+        const { withOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const rows = await withClient(creds, async (c) => {
-          const r = await c.query(limited);
-          return r.rows;
-        });
+        const rows = await withClient(
+          creds,
+          async (c) => {
+            const r = await c.query(limited);
+            return r.rows;
+          },
+          withOpts,
+        );
         ctx.audit.append({
           tool: name,
           role,
+          principal: principalSub,
           ok: true,
           sqlPreview: limited,
           detail: { rowCount: rows.length, maxRows },
@@ -215,14 +297,20 @@ export async function handleTool(
           ctx.audit.append({ tool: name, role, ok: false, error: msg, sqlPreview: sql });
           return errResult(msg);
         }
+        const { withOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const result = await withClient(creds, async (c) => {
-          const r = await c.query(sql);
-          return { rowCount: r.rowCount ?? 0, command: r.command };
-        });
+        const result = await withClient(
+          creds,
+          async (c) => {
+            const r = await c.query(sql);
+            return { rowCount: r.rowCount ?? 0, command: r.command };
+          },
+          withOpts,
+        );
         ctx.audit.append({
           tool: name,
           role,
+          principal: principalSub,
           ok: true,
           sqlPreview: sql,
           detail: { ...result, class: cls.statementClass },
@@ -263,14 +351,20 @@ export async function handleTool(
           ctx.audit.append({ tool: name, role, ok: false, error: msg, sqlPreview: sql });
           return errResult(msg);
         }
+        const { withOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const result = await withClient(creds, async (c) => {
-          const r = await c.query(sql);
-          return { rowCount: r.rowCount ?? 0, command: r.command };
-        });
+        const result = await withClient(
+          creds,
+          async (c) => {
+            const r = await c.query(sql);
+            return { rowCount: r.rowCount ?? 0, command: r.command };
+          },
+          withOpts,
+        );
         ctx.audit.append({
           tool: name,
           role,
+          principal: principalSub,
           ok: true,
           sqlPreview: sql,
           detail: { ...result, class: cls.statementClass },
@@ -298,14 +392,20 @@ export async function handleTool(
         } else if (analyze && !/analyze/i.test(explainSql)) {
           explainSql = explainSql.replace(/^explain/i, "EXPLAIN (ANALYZE, BUFFERS)");
         }
+        const { withOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const plan = await withClient(creds, async (c) => {
-          const r = await c.query(explainSql);
-          return r.rows;
-        });
+        const plan = await withClient(
+          creds,
+          async (c) => {
+            const r = await c.query(explainSql);
+            return r.rows;
+          },
+          withOpts,
+        );
         ctx.audit.append({
           tool: name,
           role,
+          principal: principalSub,
           ok: true,
           sqlPreview: explainSql,
           detail: { analyze },
@@ -321,6 +421,7 @@ export async function handleTool(
       case "whoami": {
         assertCapability(ctx.policy, "whoami");
         const p = ctx.policy;
+        const { principal } = sessionOpts(ctx, args);
         return textResult({
           role: p.roleName,
           db_user: p.role.db_user,
@@ -333,6 +434,14 @@ export async function handleTool(
           allow_explain_analyze: p.allowExplainAnalyze,
           dual_control_ddl: p.dualControlDdl,
           secrets_provider: process.env.PGGUARD_SECRETS_PROVIDER || "env",
+          principal: principal
+            ? { sub: principal.sub, email: principal.email }
+            : null,
+          principal_propagation: {
+            enabled: p.principalPropagation.enabled,
+            require_jwt: p.principalPropagation.require_jwt,
+            session_gucs: p.principalPropagation.session_gucs,
+          },
         });
       }
       default:

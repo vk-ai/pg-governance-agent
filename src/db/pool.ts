@@ -45,13 +45,30 @@ export async function closePool(): Promise<void> {
   }
 }
 
+/** Apply transaction-local GUCs for RLS (never SET ROLE). */
+export async function applySessionGucs(
+  client: pg.PoolClient,
+  gucs: Record<string, string>,
+): Promise<void> {
+  for (const [name, value] of Object.entries(gucs)) {
+    if (!/^[a-zA-Z_][a-zA-Z0-9_.]*$/.test(name)) {
+      throw new Error(`Refusing invalid GUC name: ${name}`);
+    }
+    await client.query("SELECT set_config($1, $2, true)", [name, value]);
+  }
+}
+
 export async function withClient<T>(
   creds: DbCredentials,
   fn: (client: pg.PoolClient) => Promise<T>,
+  opts?: { sessionGucs?: Record<string, string> },
 ): Promise<T> {
   const p = await getPool(creds);
   const client = await p.connect();
   try {
+    if (opts?.sessionGucs && Object.keys(opts.sessionGucs).length > 0) {
+      await applySessionGucs(client, opts.sessionGucs);
+    }
     return await fn(client);
   } finally {
     client.release();

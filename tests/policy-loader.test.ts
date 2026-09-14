@@ -46,4 +46,12 @@ describe("policy loader", () => {
     const r = validatePolicyFile(policyPath);
     expect(r.ok).toBe(true);
   });
+
+  test("loads principal_propagation defaults", () => {
+    const cfg = loadPolicyConfig(policyPath);
+    expect(cfg.principal_propagation?.enabled).toBe(true);
+    const eff = resolveEffectivePolicy(cfg, "reader");
+    expect(eff.principalPropagation.enabled).toBe(true);
+    expect(eff.principalPropagation.session_gucs["sub"]).toBe("app.user_id");
+  });
 });

@@ -32,7 +32,9 @@ PgGuard sits between an AI assistant and your PostgreSQL database. It enforces r
 | `run_ddl` | Schema changes — requires `confirm`; optional `dry_run` |
 | `explain_query` | `EXPLAIN` (`ANALYZE` gated by policy) |
 | `get_audit_tail` | Recent audit events |
-| `whoami` | Effective role + policy |
+| `whoami` | Effective role + policy (+ optional JWT principal) |
+
+**Principal propagation** — optional HS256 JWT (`bearer_token` / `PGGUARD_BEARER_TOKEN`) maps to Postgres session GUCs (`app.user_id`, …) for RLS. See [SECURITY.md](./SECURITY.md).
 
 **Roles** (`PGGUARD_ROLE`) — see [`config/policy.yaml`](./config/policy.yaml)
 

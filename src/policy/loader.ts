@@ -2,6 +2,10 @@ import fs from "node:fs";
 import path from "node:path";
 import YAML from "yaml";
 import type { Capability, PolicyConfig, RolePolicy } from "./types.js";
+import {
+  DEFAULT_PRINCIPAL_PROPAGATION,
+  type PrincipalPropagationConfig,
+} from "../auth/principal.js";
 import { log } from "../utils/logger.js";
 
 export type AgentRoleName = "reader" | "writer" | "migrator" | "admin" | string;
@@ -15,6 +19,7 @@ export interface EffectivePolicy {
   requireConfirmDdl: boolean;
   allowExplainAnalyze: boolean;
   dualControlDdl: boolean;
+  principalPropagation: PrincipalPropagationConfig;
 }
 
 export function loadPolicyConfig(policyPath?: string): PolicyConfig {
@@ -40,6 +45,16 @@ export function resolveEffectivePolicy(
     throw new Error(`Unknown PGGUARD_ROLE: ${name}. Known: ${Object.keys(config.roles).join(", ")}`);
   }
   const d = config.defaults;
+  const pp = config.principal_propagation || {};
+  const principalPropagation: PrincipalPropagationConfig = {
+    ...DEFAULT_PRINCIPAL_PROPAGATION,
+    ...pp,
+    session_gucs: {
+      ...DEFAULT_PRINCIPAL_PROPAGATION.session_gucs,
+      ...(pp.session_gucs || {}),
+    },
+    enabled: pp.enabled ?? DEFAULT_PRINCIPAL_PROPAGATION.enabled,
+  };
   return {
     roleName: name,
     role,
@@ -49,6 +64,7 @@ export function resolveEffectivePolicy(
     requireConfirmDdl: role.require_confirm_ddl ?? d.require_confirm_ddl ?? true,
     allowExplainAnalyze: role.allow_explain_analyze ?? d.allow_explain_analyze ?? false,
     dualControlDdl: role.dual_control_ddl ?? false,
+    principalPropagation,
   };
 }
 
