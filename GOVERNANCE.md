@@ -48,3 +48,8 @@ Select with env: `PGGUARD_ROLE=reader`.
 | DDL | `run_ddl` | migrator/admin + confirm |
 | EXPLAIN | `explain_query` | per role; ANALYZE gated |
 | Blocked | — | multi-stmt, COPY, SET ROLE, GRANT, dangerous fns |
+
+
+## Principal propagation
+
+End-user identity is separate from the agent role (`PGGUARD_ROLE`). The agent still connects as `db_user` from policy; JWT claims are applied only as session GUCs for RLS and appear on audit rows as `principal`. Operators should treat missing `principal` as "service account only" and enable `require_jwt` when compliance needs human attribution.

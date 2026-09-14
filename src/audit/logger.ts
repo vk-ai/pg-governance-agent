@@ -6,6 +6,7 @@ export interface AuditEvent {
   ts: string;
   tool: string;
   role: string;
+  principal?: string;
   ok: boolean;
   detail?: Record<string, unknown>;
   error?: string;
@@ -27,6 +28,7 @@ export class AuditLogger {
       ts: event.ts || new Date().toISOString(),
       tool: event.tool,
       role: event.role,
+      principal: event.principal,
       ok: event.ok,
       detail: event.detail,
       error: event.error,

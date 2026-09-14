@@ -32,8 +32,18 @@ export interface RolePolicy {
   dual_control_ddl?: boolean;
 }
 
+export interface PrincipalPropagationYaml {
+  enabled?: boolean;
+  jwt_secret_env?: string;
+  require_jwt?: boolean;
+  claim_sub?: string;
+  claim_email?: string;
+  session_gucs?: Record<string, string>;
+}
+
 export interface PolicyConfig {
   version: number;
+  principal_propagation?: PrincipalPropagationYaml;
   defaults: {
     max_rows: number;
     require_confirm_dml: boolean;

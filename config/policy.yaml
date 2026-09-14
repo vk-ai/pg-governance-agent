@@ -1,5 +1,18 @@
 # PgGuard RBAC policy — role selected via PGGUARD_ROLE
 version: 1
+
+# Propagate end-user JWT → Postgres session GUCs for RLS.
+# Does NOT unlock SET ROLE in user SQL (still blocked). PgGuard applies set_config only.
+principal_propagation:
+  enabled: true
+  jwt_secret_env: PGGUARD_JWT_SECRET
+  require_jwt: false
+  claim_sub: sub
+  claim_email: email
+  session_gucs:
+    sub: app.user_id
+    email: app.user_email
+
 defaults:
   max_rows: 100
   require_confirm_dml: true

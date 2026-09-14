@@ -37,6 +37,24 @@ Postgres grants in `docker/postgres/init/01-schema.sql` mirror this.
 
 > Defense in depth: agent policy is necessary but not sufficient — always use least-privilege DB roles.
 
+## Principal propagation (JWT → RLS)
+
+Agents often connect as a shared DB role (`app_reader` / `app_writer`). For **row-level security**, PgGuard can propagate an end-user JWT into transaction-local session GUCs:
+
+1. Pass `bearer_token` on MCP tools (or set `PGGUARD_BEARER_TOKEN`).
+2. With `PGGUARD_JWT_SECRET` set, tokens are verified as **HS256** (Node `crypto` only — no new deps).
+3. On each connection checkout, PgGuard runs `set_config('app.user_id', …, true)` (and optional email) — **never** `SET ROLE` / `SET SESSION AUTHORIZATION` from user SQL (still blocked).
+4. Audit events include `principal` (JWT `sub`) when present.
+
+Configure claim→GUC mapping under `principal_propagation` in `config/policy.yaml`. Set `require_jwt: true` in production if every DB call must be attributable to a human.
+
+Example RLS policy:
+
+```sql
+CREATE POLICY tenant_isolation ON orders
+  USING (user_id = current_setting('app.user_id', true));
+```
+
 ## Audit
 
 - Append-only JSONL: `data/audit/events.jsonl` (gitignored).
