@@ -19,6 +19,12 @@ defaults:
   require_confirm_ddl: true
   allow_explain_analyze: false
   audit_retention_days: 90
+  # Read tools (db_health, list_*, describe_table, run_select, explain_query) run
+  # inside BEGIN READ ONLY ... ROLLBACK with these transaction-local timeouts.
+  # Values are milliseconds; 0 disables. Roles may override any of them.
+  statement_timeout_ms: 15000
+  lock_timeout_ms: 2000
+  idle_in_transaction_session_timeout_ms: 30000
 
 blocked_patterns:
   - multiple_statements

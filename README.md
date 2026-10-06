@@ -166,8 +166,36 @@ Demo passwords live only in `.env.example` and Compose init scripts. **Never com
 |--------|----------------|
 | `npm run build` | Compile TypeScript → `dist/` |
 | `npm run mcp` | Start stdio MCP server |
-| `npm test` | Classifier + policy unit tests |
+| `npm test` | Unit tests (+ live Postgres tests when `PGGUARD_IT_DATABASE_URL` is set) |
 | `npm run policy:check` | Validate `config/policy.yaml` |
+
+---
+
+## Read-only transactions (let Postgres say no)
+
+Read tools (`db_health`, `list_*`, `describe_table`, `run_select`, `explain_query`) run as:
+
+```text
+BEGIN READ ONLY
+  set_config('statement_timeout' | 'lock_timeout' | 'idle_in_transaction_session_timeout', <policy>, true)
+  set_config('app.user_id', <jwt sub>, true)   -- principal GUCs, same transaction
+  <your SELECT>                                  -- extended protocol: one statement only
+ROLLBACK
+```
+
+- The classifier is the first gate. Postgres is the second: a `SELECT` that calls a writing function, or `EXPLAIN ANALYZE` of DML, fails with `cannot execute … in a read-only transaction`.
+- Timeouts come from `defaults` in `config/policy.yaml` (`statement_timeout_ms`, `lock_timeout_ms`, `idle_in_transaction_session_timeout_ms`; per-role overrides; `0` disables).
+- Principal GUCs are now set **inside** the transaction that runs the query. Before, `set_config(..., true)` ran on its own, outside any transaction, so the value was gone before the query ran. `run_dml`/`run_ddl` with a principal run in `BEGIN … COMMIT` for the same reason.
+- The demo RLS policy (`docker/postgres/optional/rls-orders-by-employee.sql`) fails closed: no principal means no rows.
+
+Try it against a throwaway database (needs a superuser URL; the Compose Postgres works):
+
+```bash
+docker compose up -d postgres
+PGGUARD_IT_DATABASE_URL=postgres://postgres:postgres_dev_only@localhost:5432/postgres npm test
+```
+
+Without `PGGUARD_IT_DATABASE_URL`, the live tests are skipped and only the unit tests run.
 
 ---
 

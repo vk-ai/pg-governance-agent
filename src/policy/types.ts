@@ -30,6 +30,10 @@ export interface RolePolicy {
   require_confirm_ddl?: boolean;
   allow_explain_analyze?: boolean;
   dual_control_ddl?: boolean;
+  /** Per-role overrides for read transactions (ms; 0 disables). */
+  statement_timeout_ms?: number;
+  lock_timeout_ms?: number;
+  idle_in_transaction_session_timeout_ms?: number;
 }
 
 export interface PrincipalPropagationYaml {
@@ -50,6 +54,10 @@ export interface PolicyConfig {
     require_confirm_ddl: boolean;
     allow_explain_analyze: boolean;
     audit_retention_days: number;
+    /** Read tools run in BEGIN READ ONLY with these SET LOCAL timeouts (ms; 0 disables). */
+    statement_timeout_ms?: number;
+    lock_timeout_ms?: number;
+    idle_in_transaction_session_timeout_ms?: number;
   };
   blocked_patterns: string[];
   dangerous_functions: string[];

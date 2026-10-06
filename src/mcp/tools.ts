@@ -1,7 +1,7 @@
 import { z } from "zod";
 import type { AppContext } from "./context.js";
 import { credsForPolicy } from "./context.js";
-import { withClient } from "../db/pool.js";
+import { withClient, withReadOnlyTransaction } from "../db/pool.js";
 import {
   resolvePrincipal,
   gucsForPrincipal,
@@ -13,6 +13,7 @@ import {
   listTables,
   describeTable,
   enforceMaxRows,
+  runUserSql,
 } from "../db/queries.js";
 import {
   assertCapability,
@@ -46,16 +47,19 @@ const bearerTokenProp = {
 function sessionOpts(ctx: AppContext, args: Record<string, unknown>): {
   principal: Principal | null;
   withOpts: { sessionGucs?: Record<string, string> };
+  readOpts: { sessionGucs?: Record<string, string>; timeouts: AppContext["policy"]["readTxn"] };
   principalSub?: string;
 } {
+  const timeouts = ctx.policy.readTxn;
   const principal = resolvePrincipal(args, ctx.policy.principalPropagation);
   if (!principal) {
-    return { principal: null, withOpts: {} };
+    return { principal: null, withOpts: {}, readOpts: { timeouts } };
   }
   const sessionGucs = gucsForPrincipal(principal, ctx.policy.principalPropagation);
   return {
     principal,
     withOpts: { sessionGucs },
+    readOpts: { sessionGucs, timeouts },
     principalSub: principal.sub,
   };
 }
@@ -194,9 +198,9 @@ export async function handleTool(
     switch (name) {
       case "db_health": {
         assertCapability(ctx.policy, "health");
-        const { principal, withOpts, principalSub } = sessionOpts(ctx, args);
+        const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const result = await withClient(creds, (c) => ping(c), withOpts);
+        const result = await withReadOnlyTransaction(creds, (c) => ping(c), readOpts);
         ctx.audit.append({
           tool: name,
           role,
@@ -208,9 +212,9 @@ export async function handleTool(
       }
       case "list_schemas": {
         assertCapability(ctx.policy, "introspect");
-        const { withOpts, principalSub } = sessionOpts(ctx, args);
+        const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const schemas = await withClient(creds, (c) => listSchemas(c), withOpts);
+        const schemas = await withReadOnlyTransaction(creds, (c) => listSchemas(c), readOpts);
         ctx.audit.append({
           tool: name,
           role,
@@ -223,9 +227,9 @@ export async function handleTool(
       case "list_tables": {
         assertCapability(ctx.policy, "introspect");
         const schema = typeof args.schema === "string" ? args.schema : undefined;
-        const { withOpts, principalSub } = sessionOpts(ctx, args);
+        const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const tables = await withClient(creds, (c) => listTables(c, schema), withOpts);
+        const tables = await withReadOnlyTransaction(creds, (c) => listTables(c, schema), readOpts);
         ctx.audit.append({
           tool: name,
           role,
@@ -239,9 +243,13 @@ export async function handleTool(
         assertCapability(ctx.policy, "introspect");
         const schema = z.string().parse(args.schema);
         const table = z.string().parse(args.table);
-        const { withOpts, principalSub } = sessionOpts(ctx, args);
+        const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const columns = await withClient(creds, (c) => describeTable(c, schema, table), withOpts);
+        const columns = await withReadOnlyTransaction(
+          creds,
+          (c) => describeTable(c, schema, table),
+          readOpts,
+        );
         ctx.audit.append({
           tool: name,
           role,
@@ -262,15 +270,15 @@ export async function handleTool(
           return errResult(msg);
         }
         const limited = enforceMaxRows(sql, maxRows);
-        const { withOpts, principalSub } = sessionOpts(ctx, args);
+        const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const rows = await withClient(
+        const rows = await withReadOnlyTransaction(
           creds,
           async (c) => {
-            const r = await c.query(limited);
+            const r = await runUserSql(c, limited);
             return r.rows;
           },
-          withOpts,
+          readOpts,
         );
         ctx.audit.append({
           tool: name,
@@ -392,15 +400,16 @@ export async function handleTool(
         } else if (analyze && !/analyze/i.test(explainSql)) {
           explainSql = explainSql.replace(/^explain/i, "EXPLAIN (ANALYZE, BUFFERS)");
         }
-        const { withOpts, principalSub } = sessionOpts(ctx, args);
+        // READ ONLY also means EXPLAIN ANALYZE of a DML statement is rejected by Postgres.
+        const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const plan = await withClient(
+        const plan = await withReadOnlyTransaction(
           creds,
           async (c) => {
-            const r = await c.query(explainSql);
+            const r = await runUserSql(c, explainSql);
             return r.rows;
           },
-          withOpts,
+          readOpts,
         );
         ctx.audit.append({
           tool: name,
@@ -433,6 +442,12 @@ export async function handleTool(
           require_confirm_ddl: p.requireConfirmDdl,
           allow_explain_analyze: p.allowExplainAnalyze,
           dual_control_ddl: p.dualControlDdl,
+          read_transaction: {
+            read_only: true,
+            statement_timeout_ms: p.readTxn.statementTimeoutMs,
+            lock_timeout_ms: p.readTxn.lockTimeoutMs,
+            idle_in_transaction_session_timeout_ms: p.readTxn.idleInTransactionSessionTimeoutMs,
+          },
           secrets_provider: process.env.PGGUARD_SECRETS_PROVIDER || "env",
           principal: principal
             ? { sub: principal.sub, email: principal.email }

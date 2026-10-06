@@ -6,7 +6,15 @@ import {
   DEFAULT_PRINCIPAL_PROPAGATION,
   type PrincipalPropagationConfig,
 } from "../auth/principal.js";
+import type { ReadTxnOptions } from "../db/pool.js";
 import { log } from "../utils/logger.js";
+
+/** Defaults used when policy.yaml does not set read-transaction timeouts. */
+export const DEFAULT_READ_TXN: Required<ReadTxnOptions> = {
+  statementTimeoutMs: 15_000,
+  lockTimeoutMs: 2_000,
+  idleInTransactionSessionTimeoutMs: 30_000,
+};
 
 export type AgentRoleName = "reader" | "writer" | "migrator" | "admin" | string;
 
@@ -20,6 +28,8 @@ export interface EffectivePolicy {
   allowExplainAnalyze: boolean;
   dualControlDdl: boolean;
   principalPropagation: PrincipalPropagationConfig;
+  /** SET LOCAL timeouts for read tools (run inside BEGIN READ ONLY). */
+  readTxn: Required<ReadTxnOptions>;
 }
 
 export function loadPolicyConfig(policyPath?: string): PolicyConfig {
@@ -65,6 +75,15 @@ export function resolveEffectivePolicy(
     allowExplainAnalyze: role.allow_explain_analyze ?? d.allow_explain_analyze ?? false,
     dualControlDdl: role.dual_control_ddl ?? false,
     principalPropagation,
+    readTxn: {
+      statementTimeoutMs:
+        role.statement_timeout_ms ?? d.statement_timeout_ms ?? DEFAULT_READ_TXN.statementTimeoutMs,
+      lockTimeoutMs: role.lock_timeout_ms ?? d.lock_timeout_ms ?? DEFAULT_READ_TXN.lockTimeoutMs,
+      idleInTransactionSessionTimeoutMs:
+        role.idle_in_transaction_session_timeout_ms ??
+        d.idle_in_transaction_session_timeout_ms ??
+        DEFAULT_READ_TXN.idleInTransactionSessionTimeoutMs,
+    },
   };
 }
 
