@@ -34,6 +34,7 @@ Postgres grants in `docker/postgres/init/01-schema.sql` mirror this.
    - Blocklist: `COPY`, `INTO OUTFILE`, `SET ROLE`, `GRANT`/`REVOKE`, user/role DDL, dangerous functions (`pg_read_file`, etc.)
 3. `run_select` appends `LIMIT` when missing (`PGGUARD_MAX_ROWS` / policy `max_rows`).
 4. Prefer connecting as `app_reader` for read paths so DB privileges backstop the agent.
+5. Read tools run in `BEGIN READ ONLY` with transaction-local `statement_timeout` / `lock_timeout` / `idle_in_transaction_session_timeout` from policy, and agent SQL uses the extended query protocol, so Postgres rejects writes and multi-statement strings even if the classifier misses them.
 
 > Defense in depth: agent policy is necessary but not sufficient — always use least-privilege DB roles.
 
@@ -43,7 +44,7 @@ Agents often connect as a shared DB role (`app_reader` / `app_writer`). For **ro
 
 1. Pass `bearer_token` on MCP tools (or set `PGGUARD_BEARER_TOKEN`).
 2. With `PGGUARD_JWT_SECRET` set, tokens are verified as **HS256** (Node `crypto` only — no new deps).
-3. On each connection checkout, PgGuard runs `set_config('app.user_id', …, true)` (and optional email) — **never** `SET ROLE` / `SET SESSION AUTHORIZATION` from user SQL (still blocked).
+3. Inside the same transaction as the tool's query, PgGuard runs `set_config('app.user_id', …, true)` (and optional email) — **never** `SET ROLE` / `SET SESSION AUTHORIZATION` from user SQL (still blocked). Read tools use `BEGIN READ ONLY … ROLLBACK`; DML/DDL with a principal use `BEGIN … COMMIT`. (`is_local = true` only lasts until the end of the current transaction, so it must not be applied as a standalone statement.)
 4. Audit events include `principal` (JWT `sub`) when present.
 
 Configure claim→GUC mapping under `principal_propagation` in `config/policy.yaml`. Set `require_jwt: true` in production if every DB call must be attributable to a human.
@@ -51,8 +52,9 @@ Configure claim→GUC mapping under `principal_propagation` in `config/policy.ya
 Example RLS policy:
 
 ```sql
+-- Fails closed: unset or '' → NULL → no rows. Avoid "OR setting IS NULL" escape hatches.
 CREATE POLICY tenant_isolation ON orders
-  USING (user_id = current_setting('app.user_id', true));
+  USING (user_id = nullif(current_setting('app.user_id', true), ''));
 ```
 
 ## Audit

@@ -53,6 +53,16 @@ export async function describeTable(
   }));
 }
 
+/**
+ * Run agent-supplied SQL with the extended query protocol so Postgres itself
+ * rejects multi-statement strings such as `SELECT 1; COMMIT; DELETE ...`
+ * (defense in depth on top of the classifier and the READ ONLY transaction).
+ */
+export async function runUserSql(client: pg.PoolClient, sql: string): Promise<pg.QueryResult> {
+  // `queryMode` exists in node-pg >= 8.12 but is not in @types/pg yet.
+  return client.query({ text: sql, queryMode: "extended" } as pg.QueryConfig);
+}
+
 /** Wrap SELECT with LIMIT if not already present (simple heuristic). */
 export function enforceMaxRows(sql: string, maxRows: number): string {
   const trimmed = sql.trim().replace(/;\s*$/, "");

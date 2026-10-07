@@ -1,14 +1,16 @@
 -- Optional demo: tenant-style RLS using session GUCs set by PgGuard principal propagation.
 -- Enable only when you want to exercise bearer_token → current_setting('app.user_id').
 -- Off by default so existing demos keep full-table SELECT behavior.
-
--- Example (uncomment to enable):
+--
+-- To enable, apply the standalone file (it is outside the init dir on purpose):
+--   psql "$DATABASE_URL" -f docker/postgres/optional/rls-orders-by-employee.sql
+--
+-- The policy fails closed: no principal (app.user_id unset or '') → no rows.
+--
+-- Example (same as the optional file):
 -- ALTER TABLE corp.orders ENABLE ROW LEVEL SECURITY;
 -- CREATE POLICY orders_by_employee ON corp.orders
 --   FOR ALL
 --   TO app_reader, app_writer
---   USING (
---     employee_id::text = nullif(current_setting('app.user_id', true), '')
---     OR current_setting('app.user_id', true) IS NULL
---     OR current_setting('app.user_id', true) = ''
---   );
+--   USING (employee_id::text = nullif(current_setting('app.user_id', true), ''))
+--   WITH CHECK (employee_id::text = nullif(current_setting('app.user_id', true), ''));
