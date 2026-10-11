@@ -26,6 +26,8 @@ export interface RolePolicy {
   allow: Capability[];
   deny: Capability[];
   max_rows?: number;
+  /** run_dml rolls back (and dry runs flag) statements affecting more rows than this. */
+  max_affected_rows?: number;
   require_confirm_dml?: boolean;
   require_confirm_ddl?: boolean;
   allow_explain_analyze?: boolean;
@@ -50,6 +52,7 @@ export interface PolicyConfig {
   principal_propagation?: PrincipalPropagationYaml;
   defaults: {
     max_rows: number;
+    max_affected_rows?: number;
     require_confirm_dml: boolean;
     require_confirm_ddl: boolean;
     allow_explain_analyze: boolean;

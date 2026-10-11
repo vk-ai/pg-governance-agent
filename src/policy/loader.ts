@@ -23,6 +23,7 @@ export interface EffectivePolicy {
   role: RolePolicy;
   config: PolicyConfig;
   maxRows: number;
+  maxAffectedRows: number;
   requireConfirmDml: boolean;
   requireConfirmDdl: boolean;
   allowExplainAnalyze: boolean;
@@ -70,6 +71,7 @@ export function resolveEffectivePolicy(
     role,
     config,
     maxRows: role.max_rows ?? d.max_rows ?? 100,
+    maxAffectedRows: role.max_affected_rows ?? d.max_affected_rows ?? 100,
     requireConfirmDml: role.require_confirm_dml ?? d.require_confirm_dml ?? true,
     requireConfirmDdl: role.require_confirm_ddl ?? d.require_confirm_ddl ?? true,
     allowExplainAnalyze: role.allow_explain_analyze ?? d.allow_explain_analyze ?? false,
@@ -115,6 +117,9 @@ export function validatePolicyFile(policyPath?: string): { ok: boolean; errors: 
     for (const [name, role] of Object.entries(cfg.roles)) {
       if (!role.db_user) errors.push(`Role ${name}: missing db_user`);
       if (!Array.isArray(role.allow)) errors.push(`Role ${name}: allow must be array`);
+      if (role.max_affected_rows !== undefined && !(Number.isInteger(role.max_affected_rows) && role.max_affected_rows >= 0)) {
+        errors.push(`Role ${name}: max_affected_rows must be a non-negative integer`);
+      }
       for (const a of role.allow || []) {
         if (!requiredCaps.includes(a as Capability) && !["health","introspect","select","dml","ddl","explain","audit_read","whoami"].includes(a)) {
           // soft warn only

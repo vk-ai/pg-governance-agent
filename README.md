@@ -28,7 +28,7 @@ PgGuard sits between an AI assistant and your PostgreSQL database. It enforces r
 | `db_health` | Ping + Postgres version |
 | `list_schemas` / `list_tables` / `describe_table` | Safe introspection |
 | `run_select` | `SELECT` only, row-capped |
-| `run_dml` | Data changes — requires `confirm: true` |
+| `run_dml` | Data changes — requires `confirm: true`; `dry_run: true` previews the affected row count; capped by `max_affected_rows` |
 | `run_ddl` | Schema changes — requires `confirm`; optional `dry_run` |
 | `explain_query` | `EXPLAIN` (`ANALYZE` gated by policy) |
 | `get_audit_tail` | Recent audit events |
@@ -196,6 +196,42 @@ PGGUARD_IT_DATABASE_URL=postgres://postgres:postgres_dev_only@localhost:5432/pos
 ```
 
 Without `PGGUARD_IT_DATABASE_URL`, the live tests are skipped and only the unit tests run.
+
+---
+
+## DML preview and row cap (`run_dml` `dry_run` + `max_affected_rows`)
+
+Agents that run `DELETE`/`UPDATE` with a bad `WHERE` clause are a common horror story
+([HN: agent deleted the prod DB](https://news.ycombinator.com/item?id=47911524),
+[HN discussion](https://news.ycombinator.com/item?id=44632270)). `run_dml` now runs every
+statement as:
+
+```text
+BEGIN
+  set_config(<timeouts>, true); set_config('app.user_id', <jwt sub>, true)   -- same as reads
+  <your INSERT/UPDATE/DELETE>          -- extended protocol: one statement only
+  dry_run        -> ROLLBACK, return rowCount (+ up to 5 RETURNING rows)
+  rowCount > cap -> ROLLBACK, return an error
+  otherwise      -> COMMIT
+```
+
+- `dry_run: true` needs no `confirm`. It returns `rowCount`, `would_exceed_cap` and a
+  `sample` from a `RETURNING` clause. The count goes through the same RLS policy and
+  principal as the real write, so it is the real count for that user at that moment.
+- `max_affected_rows` comes from `config/policy.yaml` (default 100; writer 50, migrator
+  1000, admin 10000). The cap is checked inside the write's own transaction, so there is
+  no gap between "preview said 3 rows" and "the write hit 3000".
+- Writes now also get the policy's `statement_timeout` / `lock_timeout`.
+
+**Real vs not verified.** Tested against a live Postgres 17 (9 integration tests: counts,
+RLS per principal and fail-closed, cap rollback, commit under the cap, WITH CHECK errors,
+clean pooled session) plus unit tests of the SQL order. Limits: a rolled-back statement
+still advances sequences, runs triggers (their writes are undone; anything they do outside
+the database is not), and holds row locks until the rollback, so a dry run on a hot table
+can block other writers for up to `lock_timeout`/`statement_timeout`. The count is a
+snapshot; it can differ when the real write runs later. DDL is unchanged
+(`run_ddl` `dry_run` still only parses). This repo has no CI workflow; tests were run
+locally.
 
 ---
 

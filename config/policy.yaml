@@ -15,6 +15,8 @@ principal_propagation:
 
 defaults:
   max_rows: 100
+  # run_dml: statements touching more rows than this are rolled back; dry_run reports the count.
+  max_affected_rows: 100
   require_confirm_dml: true
   require_confirm_ddl: true
   allow_explain_analyze: false
@@ -79,6 +81,7 @@ roles:
     deny:
       - ddl
     max_rows: 200
+    max_affected_rows: 50
     require_confirm_dml: true
     allow_explain_analyze: false
 
@@ -96,6 +99,7 @@ roles:
       - whoami
     deny: []
     max_rows: 500
+    max_affected_rows: 1000
     require_confirm_dml: true
     require_confirm_ddl: true
     allow_explain_analyze: true
@@ -115,6 +119,7 @@ roles:
       - whoami
     deny: []
     max_rows: 1000
+    max_affected_rows: 10000
     require_confirm_dml: true
     require_confirm_ddl: true
     allow_explain_analyze: true
