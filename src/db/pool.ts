@@ -197,3 +197,110 @@ export async function clientOn<T>(
     client.release(releaseErr);
   }
 }
+
+/** Options for {@link dmlTransactionOn}. */
+export interface DmlTxnOptions {
+  sessionGucs?: Record<string, string>;
+  timeouts?: ReadTxnOptions;
+  /** Roll back instead of committing when more rows than this are affected. */
+  maxAffectedRows?: number;
+  /** Always roll back; report what would have happened. */
+  dryRun?: boolean;
+  /** Sample rows to return from a RETURNING clause (dry run only). */
+  sampleRows?: number;
+}
+
+export interface DmlTxnResult {
+  rowCount: number;
+  command: string;
+  committed: boolean;
+  dryRun: boolean;
+  capExceeded: boolean;
+  maxAffectedRows?: number;
+  sample?: Record<string, unknown>[];
+}
+
+/** Raised when a real (non-dry-run) DML would affect more rows than the cap; it was rolled back. */
+export class AffectedRowsCapExceeded extends Error {
+  constructor(
+    public readonly rowCount: number,
+    public readonly maxAffectedRows: number,
+  ) {
+    super(
+      `DML would affect ${rowCount} rows, over the max_affected_rows cap of ${maxAffectedRows}; rolled back. ` +
+        "Narrow the WHERE clause or use a role with a higher cap.",
+    );
+    this.name = "AffectedRowsCapExceeded";
+  }
+}
+
+/**
+ * Run one DML statement in `BEGIN ... COMMIT|ROLLBACK`.
+ *
+ * Order: BEGIN → SET LOCAL timeouts → principal GUCs (RLS) → statement
+ * (extended protocol, single statement) → decide. A dry run always rolls back
+ * and returns the row count Postgres reported. A real run rolls back and throws
+ * {@link AffectedRowsCapExceeded} when the count is over the cap, so the cap is
+ * checked on the same snapshot as the write (no preview-then-write race).
+ *
+ * Rolled-back work is not free: sequences still advance, triggers still run
+ * (their writes are undone, external side effects are not) and row locks are
+ * held until the rollback. Timeouts bound how long that can take.
+ */
+export async function dmlTransactionOn(
+  connect: () => Promise<pg.PoolClient>,
+  sql: string,
+  opts: DmlTxnOptions = {},
+): Promise<DmlTxnResult> {
+  const client = await connect();
+  let releaseErr: Error | undefined;
+  try {
+    await client.query("BEGIN");
+    let finished = false;
+    try {
+      await applyLocalTimeouts(client, opts.timeouts);
+      if (opts.sessionGucs && Object.keys(opts.sessionGucs).length > 0) {
+        await applySessionGucs(client, opts.sessionGucs);
+      }
+      const r = await client.query({ text: sql, queryMode: "extended" } as pg.QueryConfig);
+      const rowCount = r.rowCount ?? 0;
+      const cap = opts.maxAffectedRows;
+      const capExceeded = cap !== undefined && cap >= 0 && rowCount > cap;
+      const base = {
+        rowCount,
+        command: String(r.command ?? ""),
+        dryRun: Boolean(opts.dryRun),
+        capExceeded,
+        maxAffectedRows: cap,
+      };
+      if (opts.dryRun) {
+        releaseErr = await rollbackQuietly(client);
+        finished = true;
+        const n = Math.max(0, opts.sampleRows ?? 5);
+        return { ...base, committed: false, sample: (r.rows ?? []).slice(0, n) };
+      }
+      if (capExceeded) {
+        releaseErr = await rollbackQuietly(client);
+        finished = true;
+        throw new AffectedRowsCapExceeded(rowCount, cap!);
+      }
+      await client.query("COMMIT");
+      finished = true;
+      return { ...base, committed: true };
+    } catch (e) {
+      if (!finished) releaseErr = await rollbackQuietly(client);
+      throw e;
+    }
+  } finally {
+    client.release(releaseErr);
+  }
+}
+
+/** {@link dmlTransactionOn} against the shared pool. */
+export async function withDmlTransaction(
+  creds: DbCredentials,
+  sql: string,
+  opts: DmlTxnOptions = {},
+): Promise<DmlTxnResult> {
+  return dmlTransactionOn(async () => (await getPool(creds)).connect(), sql, opts);
+}

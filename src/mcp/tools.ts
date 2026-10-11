@@ -1,7 +1,12 @@
 import { z } from "zod";
 import type { AppContext } from "./context.js";
 import { credsForPolicy } from "./context.js";
-import { withClient, withReadOnlyTransaction } from "../db/pool.js";
+import {
+  AffectedRowsCapExceeded,
+  withClient,
+  withDmlTransaction,
+  withReadOnlyTransaction,
+} from "../db/pool.js";
 import {
   resolvePrincipal,
   gucsForPrincipal,
@@ -125,15 +130,17 @@ export const toolDefs = [
   },
   {
     name: "run_dml",
-    description: "INSERT/UPDATE/DELETE when role allows; requires confirm:true",
+    description:
+      "INSERT/UPDATE/DELETE when role allows. dry_run:true runs it in a rolled-back transaction and returns the affected row count (no confirm needed). Real runs require confirm:true and are rolled back if they affect more than the role's max_affected_rows.",
     inputSchema: {
       type: "object" as const,
       properties: {
         sql: { type: "string" },
         confirm: { type: "boolean" },
+        dry_run: { type: "boolean", description: "Preview: execute, report rowCount (and RETURNING sample), then ROLLBACK" },
         ...bearerTokenProp,
       },
-      required: ["sql", "confirm"],
+      required: ["sql"],
       additionalProperties: false,
     },
   },
@@ -294,8 +301,9 @@ export async function handleTool(
         assertCapability(ctx.policy, "dml");
         const sql = z.string().parse(args.sql);
         const confirm = Boolean(args.confirm);
-        if (ctx.policy.requireConfirmDml && !confirm) {
-          const msg = "DML requires confirm: true";
+        const dryRun = Boolean(args.dry_run);
+        if (!dryRun && ctx.policy.requireConfirmDml && !confirm) {
+          const msg = "DML requires confirm: true (or preview it first with dry_run: true)";
           ctx.audit.append({ tool: name, role, ok: false, error: msg, sqlPreview: sql });
           return errResult(msg);
         }
@@ -305,25 +313,57 @@ export async function handleTool(
           ctx.audit.append({ tool: name, role, ok: false, error: msg, sqlPreview: sql });
           return errResult(msg);
         }
-        const { withOpts, principalSub } = sessionOpts(ctx, args);
+        const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const result = await withClient(
-          creds,
-          async (c) => {
-            const r = await c.query(sql);
-            return { rowCount: r.rowCount ?? 0, command: r.command };
-          },
-          withOpts,
-        );
-        ctx.audit.append({
-          tool: name,
-          role,
-          principal: principalSub,
-          ok: true,
-          sqlPreview: sql,
-          detail: { ...result, class: cls.statementClass },
-        });
-        return textResult({ ok: true, ...result, class: cls.statementClass });
+        const maxAffectedRows = ctx.policy.maxAffectedRows;
+        try {
+          const r = await withDmlTransaction(creds, sql, {
+            sessionGucs: readOpts.sessionGucs,
+            timeouts: ctx.policy.readTxn,
+            maxAffectedRows,
+            dryRun,
+          });
+          const out = {
+            ok: true,
+            rowCount: r.rowCount,
+            command: r.command,
+            class: cls.statementClass,
+            dry_run: r.dryRun,
+            committed: r.committed,
+            max_affected_rows: maxAffectedRows,
+            ...(r.dryRun ? { would_exceed_cap: r.capExceeded, sample: r.sample } : {}),
+          };
+          ctx.audit.append({
+            tool: name,
+            role,
+            principal: principalSub,
+            ok: true,
+            sqlPreview: sql,
+            detail: {
+              rowCount: r.rowCount,
+              command: r.command,
+              class: cls.statementClass,
+              dry_run: r.dryRun,
+              committed: r.committed,
+              max_affected_rows: maxAffectedRows,
+            },
+          });
+          return textResult(out);
+        } catch (e) {
+          if (e instanceof AffectedRowsCapExceeded) {
+            ctx.audit.append({
+              tool: name,
+              role,
+              principal: principalSub,
+              ok: false,
+              error: e.message,
+              sqlPreview: sql,
+              detail: { rowCount: e.rowCount, max_affected_rows: e.maxAffectedRows, committed: false },
+            });
+            return errResult(e.message);
+          }
+          throw e;
+        }
       }
       case "run_ddl": {
         assertCapability(ctx.policy, "ddl");
@@ -438,6 +478,7 @@ export async function handleTool(
           allow: p.role.allow,
           deny: p.role.deny,
           max_rows: p.maxRows,
+          max_affected_rows: p.maxAffectedRows,
           require_confirm_dml: p.requireConfirmDml,
           require_confirm_ddl: p.requireConfirmDdl,
           allow_explain_analyze: p.allowExplainAnalyze,
