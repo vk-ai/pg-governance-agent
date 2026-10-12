@@ -18,6 +18,7 @@ import {
   listTables,
   describeTable,
   enforceMaxRows,
+  effectiveMaxRows,
   runUserSql,
 } from "../db/queries.js";
 import {
@@ -45,7 +46,7 @@ const bearerTokenProp = {
   bearer_token: {
     type: "string" as const,
     description:
-      "Optional end-user JWT (HS256). Sets RLS session GUCs via set_config. Or env PGGUARD_BEARER_TOKEN.",
+      "End-user JWT (HS256, verified with PGGUARD_JWT_SECRET; required by default). Sets RLS session GUCs. Or env PGGUARD_BEARER_TOKEN.",
   },
 };
 
@@ -269,7 +270,7 @@ export async function handleTool(
       case "run_select": {
         assertCapability(ctx.policy, "select");
         const sql = z.string().parse(args.sql);
-        const maxRows = Number(args.max_rows ?? ctx.policy.maxRows);
+        const maxRows = effectiveMaxRows(args.max_rows, ctx.policy.maxRows);
         const cls = classifySql(sql, ctx.policy.config.dangerous_functions);
         if (!cls.ok || !isSelect(cls.statementClass)) {
           const msg = cls.reason || `Expected SELECT, got ${cls.statementClass}`;
@@ -283,7 +284,8 @@ export async function handleTool(
           creds,
           async (c) => {
             const r = await runUserSql(c, limited);
-            return r.rows;
+            // LIMIT inside a subquery skips enforceMaxRows; cap the returned rows regardless.
+            return r.rows.slice(0, maxRows);
           },
           readOpts,
         );

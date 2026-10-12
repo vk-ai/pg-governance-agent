@@ -45,6 +45,7 @@ export interface PrincipalPropagationYaml {
   claim_sub?: string;
   claim_email?: string;
   session_gucs?: Record<string, string>;
+  rls_hmac_key_env?: string;
 }
 
 export interface PolicyConfig {

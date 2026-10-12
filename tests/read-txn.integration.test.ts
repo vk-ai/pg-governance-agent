@@ -20,6 +20,7 @@ import type { AppContext } from "../src/mcp/context.js";
 import { AuditLogger } from "../src/audit/logger.js";
 import { loadPolicyConfig, resolveEffectivePolicy } from "../src/policy/loader.js";
 import type { DbCredentials } from "../src/secrets/types.js";
+import { RLS_SQL_FILES, SET_KEY_SQL, TEST_JWT_SECRET, TEST_RLS_KEY_HEX, signedJwt as unsignedJwt } from "./helpers/it-auth.js";
 
 const ADMIN_URL = process.env.PGGUARD_IT_DATABASE_URL;
 const d = ADMIN_URL ? describe : describe.skip;
@@ -27,10 +28,6 @@ const d = ADMIN_URL ? describe : describe.skip;
 const repo = process.cwd(); // jest runs from the repo root
 const dbName = `pgguard_it_${process.pid}_${Date.now()}`;
 
-function unsignedJwt(claims: Record<string, unknown>): string {
-  const enc = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
-  return `${enc({ alg: "none", typ: "JWT" })}.${enc(claims)}.`;
-}
 
 function credsFor(user: string): DbCredentials {
   const u = new URL(ADMIN_URL!);
@@ -52,6 +49,8 @@ function credsFor(user: string): DbCredentials {
 function ctxFor(roleName: string, auditDir: string): AppContext {
   const policy = resolveEffectivePolicy(loadPolicyConfig(path.join(repo, "config", "policy.yaml")), roleName);
   policy.readTxn = { ...policy.readTxn, statementTimeoutMs: 300 };
+  // Tokens are always verified here; calls without one exercise the "no principal" path.
+  policy.principalPropagation = { ...policy.principalPropagation, require_jwt: false };
   return {
     secrets: { getDbCredentials: async (user?: string) => credsFor(user || "app_reader") },
     audit: new AuditLogger(auditDir),
@@ -78,7 +77,8 @@ d("read-only transactions against live Postgres", () => {
   const savedToken = process.env.PGGUARD_BEARER_TOKEN;
 
   beforeAll(async () => {
-    delete process.env.PGGUARD_JWT_SECRET; // decode-only JWTs for the test
+    process.env.PGGUARD_JWT_SECRET = TEST_JWT_SECRET;
+    process.env.PGGUARD_RLS_HMAC_KEY = TEST_RLS_KEY_HEX;
     delete process.env.PGGUARD_BEARER_TOKEN;
     auditDir = fs.mkdtempSync(path.join(os.tmpdir(), "pgguard-it-"));
     const admin = new pg.Client({ connectionString: ADMIN_URL });
@@ -89,13 +89,10 @@ d("read-only transactions against live Postgres", () => {
     u.pathname = `/${dbName}`;
     const db = new pg.Client({ connectionString: u.toString() });
     await db.connect();
-    for (const f of [
-      "docker/postgres/init/01-schema.sql",
-      "docker/postgres/init/02-seed.sql",
-      "docker/postgres/optional/rls-orders-by-employee.sql",
-    ]) {
+    for (const f of RLS_SQL_FILES) {
       await db.query(fs.readFileSync(path.join(repo, f), "utf8"));
     }
+    await db.query(SET_KEY_SQL);
     // A SELECT-shaped call with a write side effect: passes the classifier,
     // must be stopped by Postgres.
     await db.query(`
@@ -114,6 +111,8 @@ d("read-only transactions against live Postgres", () => {
     await admin.end();
     fs.rmSync(auditDir, { recursive: true, force: true });
     if (savedSecret !== undefined) process.env.PGGUARD_JWT_SECRET = savedSecret;
+    else delete process.env.PGGUARD_JWT_SECRET;
+    delete process.env.PGGUARD_RLS_HMAC_KEY;
     if (savedToken !== undefined) process.env.PGGUARD_BEARER_TOKEN = savedToken;
   });
 
@@ -163,7 +162,10 @@ d("read-only transactions against live Postgres", () => {
 
   test("statement_timeout from policy is applied (SET LOCAL)", async () => {
     const { isError, body } = parse(
-      await handleTool(ctxFor("reader", auditDir), "run_select", { sql: "SELECT pg_sleep(2)" }),
+      await handleTool(ctxFor("reader", auditDir), "run_select", {
+        // pg_sleep is now blocked by the classifier, so burn CPU instead.
+        sql: "SELECT count(*) FROM generate_series(1, 500000000) g",
+      }),
     );
     expect(isError).toBe(true);
     expect(body.error).toMatch(/statement timeout/);

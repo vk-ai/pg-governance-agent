@@ -7,11 +7,25 @@ const { Pool } = pg;
 let pool: pg.Pool | null = null;
 let currentUser: string | null = null;
 
+/**
+ * libpq sslmode → node-pg TLS options.
+ * verify-ca / verify-full: certificate chain must validate (rejectUnauthorized).
+ * verify-ca skips only the hostname check, matching libpq. require/prefer/allow
+ * encrypt without verifying, as in libpq. Unknown modes are refused.
+ */
+export function sslConfigFor(sslmode: string | undefined): pg.PoolConfig["ssl"] {
+  const mode = (sslmode || "").trim().toLowerCase();
+  if (!mode || mode === "disable") return undefined;
+  if (mode === "verify-full") return { rejectUnauthorized: true };
+  if (mode === "verify-ca") {
+    return { rejectUnauthorized: true, checkServerIdentity: () => undefined };
+  }
+  if (mode === "require" || mode === "prefer" || mode === "allow") return { rejectUnauthorized: false };
+  throw new Error(`Unsupported sslmode: ${sslmode}`);
+}
+
 export function buildConnectionConfig(creds: DbCredentials): pg.PoolConfig {
-  const ssl =
-    creds.sslmode && creds.sslmode !== "disable"
-      ? { rejectUnauthorized: creds.sslmode === "verify-full" }
-      : undefined;
+  const ssl = sslConfigFor(creds.sslmode);
   return {
     host: creds.host,
     port: creds.port,

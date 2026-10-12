@@ -68,21 +68,67 @@ describe("principal / JWT", () => {
     }
   });
 
-  test("resolvePrincipal without secret decodes only", () => {
+  test("resolvePrincipal without secret fails closed", () => {
     const prev = process.env.PGGUARD_JWT_SECRET;
     delete process.env.PGGUARD_JWT_SECRET;
     try {
       const token = signHs256({ sub: "dev-user", email: "d@x.com" }, secret);
-      const p = resolvePrincipal({ bearer_token: token }, {
-        ...DEFAULT_PRINCIPAL_PROPAGATION,
-        require_jwt: false,
-      });
-      expect(p?.sub).toBe("dev-user");
-      // decode path still works
-      expect(decodeJwtPayload(token).sub).toBe("dev-user");
+      expect(() =>
+        resolvePrincipal({ bearer_token: token }, { ...DEFAULT_PRINCIPAL_PROPAGATION, require_jwt: false }),
+      ).toThrow(/cannot be verified/);
     } finally {
       if (prev !== undefined) process.env.PGGUARD_JWT_SECRET = prev;
     }
+  });
+
+  test("dev-only flag re-enables decode-only tokens", () => {
+    const prev = process.env.PGGUARD_JWT_SECRET;
+    delete process.env.PGGUARD_JWT_SECRET;
+    process.env.PGGUARD_DEV_INSECURE_JWT = "1";
+    try {
+      const token = signHs256({ sub: "dev-user", email: "d@x.com" }, secret);
+      const p = resolvePrincipal({ bearer_token: token }, DEFAULT_PRINCIPAL_PROPAGATION);
+      expect(p?.sub).toBe("dev-user");
+      expect(decodeJwtPayload(token).sub).toBe("dev-user");
+      expect(resolvePrincipal({}, DEFAULT_PRINCIPAL_PROPAGATION)).toBeNull();
+    } finally {
+      delete process.env.PGGUARD_DEV_INSECURE_JWT;
+      if (prev !== undefined) process.env.PGGUARD_JWT_SECRET = prev;
+    }
+  });
+
+  test("forged token (wrong secret, alg none) is rejected when a secret is set", () => {
+    const prev = process.env.PGGUARD_JWT_SECRET;
+    process.env.PGGUARD_JWT_SECRET = secret;
+    try {
+      const forged = signHs256({ sub: "2" }, "attacker-secret");
+      expect(() => resolvePrincipal({ bearer_token: forged }, DEFAULT_PRINCIPAL_PROPAGATION)).toThrow(/signature/);
+      const enc = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
+      const none = `${enc({ alg: "none" })}.${enc({ sub: "2" })}.`;
+      expect(() => resolvePrincipal({ bearer_token: none }, DEFAULT_PRINCIPAL_PROPAGATION)).toThrow(/alg/);
+    } finally {
+      if (prev === undefined) delete process.env.PGGUARD_JWT_SECRET;
+      else process.env.PGGUARD_JWT_SECRET = prev;
+    }
+  });
+
+  test("require_jwt is on by default", () => {
+    expect(DEFAULT_PRINCIPAL_PROPAGATION.require_jwt).toBe(true);
+    expect(() => resolvePrincipal({}, DEFAULT_PRINCIPAL_PROPAGATION)).toThrow(/required/i);
+  });
+
+  test("RLS MAC GUC is added when the HMAC key is set", () => {
+    const key = "00112233445566778899aabbccddeeff";
+    process.env.PGGUARD_RLS_HMAC_KEY = key;
+    try {
+      const gucs = gucsForPrincipal(principalFromClaims({ sub: "7" }));
+      const want = createHmac("sha256", Buffer.from(key, "hex")).update("pgguard:v1:7").digest("hex");
+      expect(gucs["app.user_id"]).toBe("7");
+      expect(gucs["app.user_id_mac"]).toBe(want);
+    } finally {
+      delete process.env.PGGUARD_RLS_HMAC_KEY;
+    }
+    expect(gucsForPrincipal(principalFromClaims({ sub: "7" }))["app.user_id_mac"]).toBeUndefined();
   });
 
   test("require_jwt fails without token", () => {

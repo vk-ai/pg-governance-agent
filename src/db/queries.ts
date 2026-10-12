@@ -69,3 +69,14 @@ export function enforceMaxRows(sql: string, maxRows: number): string {
   if (/\blimit\s+\d+/i.test(trimmed)) return trimmed;
   return `${trimmed} LIMIT ${Math.max(1, maxRows)}`;
 }
+
+/**
+ * Row cap the agent cannot raise: min(requested, policy). Invalid or missing
+ * requests fall back to the policy value; the result is at least 1.
+ */
+export function effectiveMaxRows(requested: unknown, policyMax: number): number {
+  const cap = Math.max(1, Math.floor(Number(policyMax) || 1));
+  const n = Number(requested);
+  if (requested === undefined || requested === null || !Number.isFinite(n) || n < 1) return cap;
+  return Math.min(Math.floor(n), cap);
+}

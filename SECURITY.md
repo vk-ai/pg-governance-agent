@@ -31,8 +31,8 @@ Postgres grants in `docker/postgres/init/01-schema.sql` mirror this.
 2. **User-supplied SQL** is never string-concatenated with untrusted identifiers from the model beyond the statement itself; instead:
    - Single-statement enforcement
    - Statement-class allowlist (SELECT / DML / DDL / EXPLAIN)
-   - Blocklist: `COPY`, `INTO OUTFILE`, `SET ROLE`, `GRANT`/`REVOKE`, user/role DDL, dangerous functions (`pg_read_file`, etc.)
-3. `run_select` appends `LIMIT` when missing (`PGGUARD_MAX_ROWS` / policy `max_rows`).
+   - Blocklist: `COPY`, `INTO OUTFILE`, `SET ROLE`, `GRANT`/`REVOKE`, user/role DDL, and dangerous functions found by walking the SQL AST plus a quote-aware lexer (`set_config`, `dblink*`, `*fdw*`, `pg_terminate_backend`, `pg_cancel_backend`, `pg_advisory*`, `pg_sleep*`, `pg_read_file`, `lo_*`, …). Quoted and schema-qualified names are caught. This is a denylist and a second layer only.
+3. `run_select` caps rows at `min(max_rows argument, policy max_rows)`: it appends `LIMIT` when missing and truncates the result, so a subquery `LIMIT` cannot skip the cap.
 4. Prefer connecting as `app_reader` for read paths so DB privileges backstop the agent.
 5. Read tools run in `BEGIN READ ONLY` with transaction-local `statement_timeout` / `lock_timeout` / `idle_in_transaction_session_timeout` from policy, and agent SQL uses the extended query protocol, so Postgres rejects writes and multi-statement strings even if the classifier misses them.
 
@@ -43,18 +43,21 @@ Postgres grants in `docker/postgres/init/01-schema.sql` mirror this.
 Agents often connect as a shared DB role (`app_reader` / `app_writer`). For **row-level security**, PgGuard can propagate an end-user JWT into transaction-local session GUCs:
 
 1. Pass `bearer_token` on MCP tools (or set `PGGUARD_BEARER_TOKEN`).
-2. With `PGGUARD_JWT_SECRET` set, tokens are verified as **HS256** (Node `crypto` only — no new deps).
+2. Tokens are verified as **HS256** with `PGGUARD_JWT_SECRET` (Node `crypto` only — no new deps). With no secret, tokens are **refused** (fail closed). `require_jwt: true` is the default. `PGGUARD_DEV_INSECURE_JWT=1` allows decode-only tokens and token-less calls for local dev only.
 3. Inside the same transaction as the tool's query, PgGuard runs `set_config('app.user_id', …, true)` (and optional email) — **never** `SET ROLE` / `SET SESSION AUTHORIZATION` from user SQL (still blocked). Read tools use `BEGIN READ ONLY … ROLLBACK`; DML/DDL with a principal use `BEGIN … COMMIT`. (`is_local = true` only lasts until the end of the current transaction, so it must not be applied as a standalone statement.)
 4. Audit events include `principal` (JWT `sub`) when present.
 
-Configure claim→GUC mapping under `principal_propagation` in `config/policy.yaml`. Set `require_jwt: true` in production if every DB call must be attributable to a human.
+Configure claim→GUC mapping under `principal_propagation` in `config/policy.yaml`. Keep `require_jwt: true` in production.
+
+**Do not let RLS trust `current_setting('app.user_id')` directly.** Any role can call `set_config` on a custom GUC, so agent SQL could switch tenants. Install `docker/postgres/optional/rls-principal-verify.sql`, load the key with `pgguard.set_rls_key(...)`, give PgGuard the same hex key in `PGGUARD_RLS_HMAC_KEY`, and write policies against `pgguard.current_user_id()`, which returns the id only when PgGuard's HMAC in `app.user_id_mac` verifies.
 
 Example RLS policy:
 
 ```sql
 -- Fails closed: unset or '' → NULL → no rows. Avoid "OR setting IS NULL" escape hatches.
+-- pgguard.current_user_id() returns NULL unless the HMAC verifies.
 CREATE POLICY tenant_isolation ON orders
-  USING (user_id = nullif(current_setting('app.user_id', true), ''));
+  USING (user_id::text = pgguard.current_user_id());
 ```
 
 ## Audit

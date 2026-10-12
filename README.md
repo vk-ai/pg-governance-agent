@@ -34,7 +34,7 @@ PgGuard sits between an AI assistant and your PostgreSQL database. It enforces r
 | `get_audit_tail` | Recent audit events |
 | `whoami` | Effective role + policy (+ optional JWT principal) |
 
-**Principal propagation** — optional HS256 JWT (`bearer_token` / `PGGUARD_BEARER_TOKEN`) maps to Postgres session GUCs (`app.user_id`, …) for RLS. See [SECURITY.md](./SECURITY.md).
+**Principal propagation** — HS256 JWT, verified and required by default, (`bearer_token` / `PGGUARD_BEARER_TOKEN`) maps to Postgres session GUCs (`app.user_id`, …) for RLS. See [SECURITY.md](./SECURITY.md).
 
 **Roles** (`PGGUARD_ROLE`) — see [`config/policy.yaml`](./config/policy.yaml)
 
@@ -237,10 +237,25 @@ locally.
 
 ## Security notes (short)
 
-- Prefer TLS (`PGSSLMODE=require` / `verify-full`) against real databases.
-- Use least-privilege DB roles; keep DML/DDL behind `confirm`.
-- Audit JSONL under `data/audit/` is append-only — ship or retain per your policy.
-- Compose Vault is **dev mode** for demos only.
+**Phase 1 security fixes (this is a learning project; the threat model and limits are below).**
+
+What changed, and why:
+
+- **Cross-tenant read via `set_config` (fixed, reproduced live).** Before, `SELECT * FROM corp.orders WHERE set_config('app.user_id','2',true) IS NOT NULL` let user 1 read user 2's rows, because the RLS policy trusted a plain GUC that any role can rewrite. `tests/rls-spoof.integration.test.ts` reproduces the leak on Postgres 17 with the old policy, then shows it is blocked.
+  - *DB layer (the real fix):* Postgres cannot make a custom GUC read-only, so a SECURITY DEFINER *setter* alone would not help. Instead PgGuard also sets `app.user_id_mac = HMAC-SHA256(key, 'pgguard:v1:'||user_id)` and the policy calls `pgguard.current_user_id()`, a SECURITY DEFINER function that reads the key from a table the agent roles cannot read and returns the id only if the MAC verifies (`docker/postgres/optional/rls-principal-verify.sql`). A rewritten id gives NULL → no rows. I chose this over per-tenant roles because it needs one key, no role per user and no `SET ROLE` from the gateway.
+  - *Gateway layer:* function calls are checked by walking the parsed SQL (AST) plus a quote-aware lexer, not by regex. `set_config`, `dblink*`, `*fdw*` functions, `pg_terminate_backend`/`pg_cancel_backend`, advisory locks, `pg_sleep*` and file/large-object functions are blocked, including `"dblink"(`, `pg_catalog."SET_CONFIG"(`, calls in CTEs/subqueries/WHERE, inside `EXPLAIN`, and SQL the parser cannot read. `CREATE SERVER`/`FOREIGN TABLE`/`EXTENSION`, `USER MAPPING` and `U&` escapes are refused.
+- **Verified identity, fail closed.** `require_jwt: true` by default; tokens must verify as HS256 with `PGGUARD_JWT_SECRET`. With no secret, tokens are refused instead of decoded. `PGGUARD_DEV_INSECURE_JWT=1` restores decode-only/no-token behaviour for local dev only.
+- **Row cap the agent can't raise.** `run_select` uses `min(max_rows, policy max_rows)` and truncates returned rows, so a `LIMIT` inside a subquery no longer skips the cap.
+- **TLS.** `sslmode=verify-ca` now validates the certificate chain (it used to set `rejectUnauthorized:false`); `verify-full` also checks the hostname; unknown modes are refused.
+
+Still true / not fixed yet (phases 2–5):
+
+- The token is still a tool argument. It must be signed, but an agent holding several users' tokens can pick among them.
+- The HMAC key is static per deployment, with no expiry or session binding; an agent can read its *own* MAC. Key rotation is manual (`pgguard.set_rls_key`). Avoid `log_statement=all` / parameter logging, which would record MACs.
+- Function blocking is a denylist; a new or extension function with side effects is not caught. Read-only access, timeouts and schemas are still enforced per transaction by the app, not on the DB role (phase 2). No schema allowlist or byte cap yet (phase 3). `confirm:true` is still agent-supplied, not human approval (phase 4). No DB host allowlist, tamper-evident audit or CI against Postgres (phase 5).
+- Old RLS policies that read `current_setting('app.user_id')` directly are still spoofable at the DB layer; move them to `pgguard.current_user_id()`.
+
+Also: use least-privilege DB roles, keep DML/DDL behind `confirm`, ship `data/audit/` off the box, and treat Compose Vault as dev-only.
 
 Full guidance: [SECURITY.md](./SECURITY.md) · [GOVERNANCE.md](./GOVERNANCE.md) · [ARCHITECTURE.md](./ARCHITECTURE.md)
 
