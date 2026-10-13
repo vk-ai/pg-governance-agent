@@ -5,11 +5,14 @@ import {
   resolveEffectivePolicy,
   type EffectivePolicy,
 } from "../policy/index.js";
+import type { PreflightResult } from "../db/preflight.js";
 
 export interface AppContext {
   secrets: SecretsProvider;
   audit: AuditLogger;
   policy: EffectivePolicy;
+  /** Result of startup DB preflight (role hardens, timeouts, no FDW). */
+  preflight?: PreflightResult;
 }
 
 export function createAppContext(): AppContext {

@@ -17,6 +17,7 @@
 -- Note: table owners and superusers bypass RLS unless FORCE ROW LEVEL SECURITY is set.
 
 ALTER TABLE corp.orders ENABLE ROW LEVEL SECURITY;
+ALTER TABLE corp.orders FORCE ROW LEVEL SECURITY;
 
 DROP POLICY IF EXISTS orders_by_employee ON corp.orders;
 CREATE POLICY orders_by_employee ON corp.orders

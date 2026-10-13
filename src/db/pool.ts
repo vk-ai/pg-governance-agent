@@ -164,34 +164,79 @@ export async function readOnlyTransactionOn<T>(
   }
 }
 
+/** Options for {@link withClient} / {@link clientOn} (DDL and other write paths). */
+export interface ClientOpts {
+  sessionGucs?: Record<string, string>;
+  /** Transaction-local timeouts (same GUCs as read/DML paths). Applied even on the autocommit path via SET, then reset. */
+  timeouts?: ReadTxnOptions;
+}
+
 /**
  * Check out a client for write paths (DML/DDL).
  *
  * When principal GUCs are present the work runs in `BEGIN ... COMMIT` so the
  * transaction-local GUCs are still set when the user's statement runs (RLS
  * sees the principal). Without GUCs the statement runs as before (autocommit),
- * which keeps DDL like `CREATE INDEX CONCURRENTLY` working.
+ * which keeps DDL like `CREATE INDEX CONCURRENTLY` working — timeouts are still
+ * applied with session `SET` and cleared in `finally` so the pooled connection
+ * is clean.
  */
 export async function withClient<T>(
   creds: DbCredentials,
   fn: (client: pg.PoolClient) => Promise<T>,
-  opts?: { sessionGucs?: Record<string, string> },
+  opts?: ClientOpts,
 ): Promise<T> {
   return clientOn(async () => (await getPool(creds)).connect(), fn, opts);
+}
+
+/** Apply timeouts outside a transaction (session SET) for autocommit DDL. */
+async function applySessionTimeouts(
+  client: pg.PoolClient,
+  opts: ReadTxnOptions = {},
+): Promise<string[]> {
+  const restored: string[] = [];
+  const pairs: [string, number | undefined][] = [
+    ["statement_timeout", opts.statementTimeoutMs],
+    ["lock_timeout", opts.lockTimeoutMs],
+    ["idle_in_transaction_session_timeout", opts.idleInTransactionSessionTimeoutMs],
+  ];
+  for (const [name, ms] of pairs) {
+    const v = timeoutValue(ms);
+    if (v === null) continue;
+    await client.query(`SET ${name} = ${quoteTimeout(v)}`);
+    restored.push(name);
+  }
+  return restored;
+}
+
+function quoteTimeout(v: string): string {
+  // timeoutValue returns a non-negative integer string (ms)
+  if (!/^\d+$/.test(v)) throw new Error(`Refusing invalid timeout literal: ${v}`);
+  return v === "0" ? "0" : `'${v}ms'`;
+}
+
+async function resetSessionTimeouts(client: pg.PoolClient, names: string[]): Promise<void> {
+  for (const name of names) {
+    await client.query(`RESET ${name}`).catch(() => undefined);
+  }
 }
 
 /** Same as {@link withClient} with an injectable checkout (unit tests). */
 export async function clientOn<T>(
   connect: () => Promise<pg.PoolClient>,
   fn: (client: pg.PoolClient) => Promise<T>,
-  opts?: { sessionGucs?: Record<string, string> },
+  opts?: ClientOpts,
 ): Promise<T> {
   const client = await connect();
   const gucs = opts?.sessionGucs;
-  if (!gucs || Object.keys(gucs).length === 0) {
+  const hasGucs = Boolean(gucs && Object.keys(gucs).length > 0);
+  if (!hasGucs) {
+    let setNames: string[] = [];
     try {
+      if (opts?.timeouts) setNames = await applySessionTimeouts(client, opts.timeouts);
       return await fn(client);
     } finally {
+      if (setNames.length) await resetSessionTimeouts(client, setNames);
       client.release();
     }
   }
@@ -199,7 +244,8 @@ export async function clientOn<T>(
   try {
     await client.query("BEGIN");
     try {
-      await applySessionGucs(client, gucs);
+      await applyLocalTimeouts(client, opts?.timeouts);
+      await applySessionGucs(client, gucs!);
       const out = await fn(client);
       await client.query("COMMIT");
       return out;
