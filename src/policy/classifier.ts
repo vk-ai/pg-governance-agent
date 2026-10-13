@@ -1,5 +1,6 @@
 import { parse, Statement } from "pgsql-ast-parser";
 import type { ClassificationResult, StatementClass } from "./types.js";
+import { astFunctionNames, isBlockedFunction, lexBlockedKeywords, lexFunctionNames } from "./sqlscan.js";
 
 const DANGEROUS_FN_DEFAULT = [
   "pg_read_file",
@@ -35,10 +36,12 @@ function heuristicBlocked(sql: string, dangerousFns: string[]): string | null {
   if (/\b(CREATE|ALTER|DROP)\s+(USER|ROLE)\b/.test(upper)) return "USER/ROLE DDL is blocked";
   if (/\b(GRANT|REVOKE)\b/.test(upper)) return "GRANT/REVOKE is blocked";
 
-  for (const fn of dangerousFns) {
-    const escaped = fn.replace(/[.*+?^${}()|[\]\\]/g, "\\$&");
-    const re = new RegExp("\\b" + escaped + "\\s*\\(", "i");
-    if (re.test(s)) return `Dangerous function blocked: ${fn}`;
+  // Quote-aware lexer pass (catches "dblink"(, pg_catalog."set_config"(, unparseable SQL).
+  const kw = lexBlockedKeywords(sql);
+  if (kw) return kw;
+  for (const name of lexFunctionNames(sql)) {
+    const hit = isBlockedFunction(name, dangerousFns);
+    if (hit) return `Dangerous function blocked: ${hit}`;
   }
   return null;
 }
@@ -98,11 +101,20 @@ export function classifySql(
 
   const upper = stripComments(trimmed).trim().toUpperCase();
   if (upper.startsWith("EXPLAIN")) {
+    // The lexer pass above already covered the explained statement's function calls.
     return { ok: true, statementClass: "explain", statements: 1 };
   }
 
   try {
     const ast = parse(trimmed);
+    for (const stmt of ast) {
+      for (const fname of astFunctionNames(stmt)) {
+        const hit = isBlockedFunction(fname, dangerousFunctions);
+        if (hit) {
+          return { ok: false, statementClass: "blocked", reason: `Dangerous function blocked: ${hit}`, statements: ast.length };
+        }
+      }
+    }
     if (!ast || ast.length === 0) {
       return { ok: false, statementClass: "blocked", reason: "Unable to parse SQL", statements: 0 };
     }

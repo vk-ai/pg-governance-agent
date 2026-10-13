@@ -23,19 +23,40 @@ export interface PrincipalPropagationConfig {
   claim_email: string;
   /** Map claim keys → Postgres GUC names (e.g. sub → app.user_id). */
   session_gucs: Record<string, string>;
+  /**
+   * Env var holding the hex HMAC key shared with pgguard.current_user_id() in the DB.
+   * When set, PgGuard also sets `<sub GUC>_mac` so RLS can verify the principal.
+   */
+  rls_hmac_key_env: string;
+}
+
+/** Env flag that re-enables unverified (decode-only) JWTs and missing tokens. Dev only. */
+export const DEV_INSECURE_JWT_FLAG = "PGGUARD_DEV_INSECURE_JWT";
+
+export function devInsecureJwtEnabled(): boolean {
+  return process.env[DEV_INSECURE_JWT_FLAG] === "1";
 }
 
 export const DEFAULT_PRINCIPAL_PROPAGATION: PrincipalPropagationConfig = {
   enabled: true,
   jwt_secret_env: "PGGUARD_JWT_SECRET",
-  require_jwt: false,
+  require_jwt: true,
   claim_sub: "sub",
   claim_email: "email",
   session_gucs: {
     sub: "app.user_id",
     email: "app.user_email",
   },
+  rls_hmac_key_env: "PGGUARD_RLS_HMAC_KEY",
 };
+
+/** MAC that pgguard.current_user_id() recomputes: hex(HMAC-SHA256(key, 'pgguard:v1:' + id)). */
+export function principalMac(userId: string, keyHex: string): string {
+  if (!/^([0-9a-fA-F]{2}){16,64}$/.test(keyHex)) {
+    throw new PrincipalError("RLS HMAC key must be 16-64 bytes of hex");
+  }
+  return createHmac("sha256", Buffer.from(keyHex, "hex")).update("pgguard:v1:" + userId, "utf8").digest("hex");
+}
 
 export class PrincipalError extends Error {
   constructor(message: string) {
@@ -133,6 +154,11 @@ export function gucsForPrincipal(
     if (value === undefined || value === null) continue;
     out[guc] = String(value);
   }
+  const subGuc = cfg.session_gucs?.sub;
+  const keyHex = cfg.rls_hmac_key_env ? process.env[cfg.rls_hmac_key_env] : undefined;
+  if (subGuc && out[subGuc] !== undefined && keyHex) {
+    out[`${subGuc}_mac`] = principalMac(out[subGuc]!, keyHex.trim());
+  }
   return out;
 }
 
@@ -149,17 +175,24 @@ export function resolvePrincipal(
   cfg: PrincipalPropagationConfig,
 ): Principal | null {
   if (!cfg.enabled) return null;
+  const dev = devInsecureJwtEnabled();
   const token = resolveBearerToken(args);
   if (!token) {
-    if (cfg.require_jwt) {
+    if (cfg.require_jwt && !dev) {
       throw new PrincipalError("bearer_token (or PGGUARD_BEARER_TOKEN) is required");
     }
     return null;
   }
   const secret = process.env[cfg.jwt_secret_env] || "";
   if (secret) {
-    return verifyHs256Jwt(token, secret);
+    return principalFromClaims(verifyHs256Jwt(token, secret).claims, cfg);
   }
-  // No secret configured: decode only (dev / trusted mesh). Production should set the secret.
+  if (!dev) {
+    // Fail closed: an unverified token would let the agent pick any identity.
+    throw new PrincipalError(
+      `${cfg.jwt_secret_env} is not set, so the bearer token cannot be verified. ` +
+        `Set the secret (or ${DEV_INSECURE_JWT_FLAG}=1 for local dev only).`,
+    );
+  }
   return principalFromClaims(decodeJwtPayload(token), cfg);
 }

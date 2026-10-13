@@ -6,12 +6,17 @@ version: 1
 principal_propagation:
   enabled: true
   jwt_secret_env: PGGUARD_JWT_SECRET
-  require_jwt: false
+  # Fail closed: tokens must be HS256-verified with PGGUARD_JWT_SECRET. Local dev only:
+  # PGGUARD_DEV_INSECURE_JWT=1 allows decode-only tokens and calls without a token.
+  require_jwt: true
   claim_sub: sub
   claim_email: email
   session_gucs:
     sub: app.user_id
     email: app.user_email
+  # Hex key shared with pgguard.current_user_id() (docker/postgres/optional/rls-principal-verify.sql).
+  # When set, PgGuard also sets app.user_id_mac so RLS can reject a rewritten app.user_id.
+  rls_hmac_key_env: PGGUARD_RLS_HMAC_KEY
 
 defaults:
   max_rows: 100

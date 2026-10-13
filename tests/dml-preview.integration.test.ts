@@ -18,6 +18,7 @@ import type { AppContext } from "../src/mcp/context.js";
 import { AuditLogger } from "../src/audit/logger.js";
 import { loadPolicyConfig, resolveEffectivePolicy } from "../src/policy/loader.js";
 import type { DbCredentials } from "../src/secrets/types.js";
+import { RLS_SQL_FILES, SET_KEY_SQL, TEST_JWT_SECRET, TEST_RLS_KEY_HEX, signedJwt as unsignedJwt } from "./helpers/it-auth.js";
 
 const ADMIN_URL = process.env.PGGUARD_IT_DATABASE_URL;
 const d = ADMIN_URL ? describe : describe.skip;
@@ -25,10 +26,6 @@ const d = ADMIN_URL ? describe : describe.skip;
 const repo = process.cwd(); // jest runs from the repo root
 const dbName = `pgguard_dml_${process.pid}_${Date.now()}`;
 
-function unsignedJwt(claims: Record<string, unknown>): string {
-  const enc = (o: unknown) => Buffer.from(JSON.stringify(o)).toString("base64url");
-  return `${enc({ alg: "none", typ: "JWT" })}.${enc(claims)}.`;
-}
 
 function credsFor(user: string): DbCredentials {
   const u = new URL(ADMIN_URL!);
@@ -50,6 +47,8 @@ function credsFor(user: string): DbCredentials {
 function ctxFor(roleName: string, auditDir: string): AppContext {
   const policy = resolveEffectivePolicy(loadPolicyConfig(path.join(repo, "config", "policy.yaml")), roleName);
   policy.readTxn = { ...policy.readTxn, statementTimeoutMs: 300 };
+  // Tokens are always verified here; calls without one exercise the "no principal" path.
+  policy.principalPropagation = { ...policy.principalPropagation, require_jwt: false };
   return {
     secrets: { getDbCredentials: async (user?: string) => credsFor(user || "app_reader") },
     audit: new AuditLogger(auditDir),
@@ -81,7 +80,8 @@ d("run_dml dry run + max_affected_rows against live Postgres", () => {
     Number((await adminDb.query(`SELECT count(*)::int AS n FROM corp.orders WHERE ${where}`)).rows[0].n);
 
   beforeAll(async () => {
-    delete process.env.PGGUARD_JWT_SECRET;
+    process.env.PGGUARD_JWT_SECRET = TEST_JWT_SECRET;
+    process.env.PGGUARD_RLS_HMAC_KEY = TEST_RLS_KEY_HEX;
     delete process.env.PGGUARD_BEARER_TOKEN;
     auditDir = fs.mkdtempSync(path.join(os.tmpdir(), "pgguard-dml-"));
     const admin = new pg.Client({ connectionString: ADMIN_URL });
@@ -92,13 +92,10 @@ d("run_dml dry run + max_affected_rows against live Postgres", () => {
     u.pathname = `/${dbName}`;
     adminDb = new pg.Client({ connectionString: u.toString() });
     await adminDb.connect();
-    for (const f of [
-      "docker/postgres/init/01-schema.sql",
-      "docker/postgres/init/02-seed.sql",
-      "docker/postgres/optional/rls-orders-by-employee.sql",
-    ]) {
+    for (const f of RLS_SQL_FILES) {
       await adminDb.query(fs.readFileSync(path.join(repo, f), "utf8"));
     }
+    await adminDb.query(SET_KEY_SQL);
     // 120 extra pending orders for employee 1 (Ada): enough to trip the writer cap of 50.
     await adminDb.query(
       "INSERT INTO corp.orders (org_id, employee_id, amount_cents, status) SELECT 1, 1, g, 'pending' FROM generate_series(1, 120) g",
@@ -113,6 +110,8 @@ d("run_dml dry run + max_affected_rows against live Postgres", () => {
     await admin.query(`DROP DATABASE IF EXISTS ${dbName} WITH (FORCE)`);
     await admin.end();
     if (savedSecret !== undefined) process.env.PGGUARD_JWT_SECRET = savedSecret;
+    else delete process.env.PGGUARD_JWT_SECRET;
+    delete process.env.PGGUARD_RLS_HMAC_KEY;
     if (savedToken !== undefined) process.env.PGGUARD_BEARER_TOKEN = savedToken;
   });
 
