@@ -19,6 +19,26 @@
 
 Postgres grants in `docker/postgres/init/01-schema.sql` mirror this.
 
+### DB-native role controls (phase 2)
+
+`docker/postgres/init/04-agent-roles.sql` (and `scripts/provision-roles.sql` for existing DBs) harden the login roles:
+
+| Control | `app_reader` | `app_writer` / `app_migrator` |
+|---------|--------------|-------------------------------|
+| `NOSUPERUSER` / `NOBYPASSRLS` | yes | yes |
+| `default_transaction_read_only` | `on` | `off` |
+| `statement_timeout` | 15s | 15s / 60s |
+| `lock_timeout` / `idle_in_transaction_session_timeout` | yes | yes |
+| `search_path` | `corp` | `corp` |
+| `CONNECTION LIMIT` | 10 | 5 / 3 |
+| `REVOKE CREATE, USAGE ON SCHEMA public FROM PUBLIC` | yes (database-wide) | same |
+| `FORCE ROW LEVEL SECURITY` on `corp.*` tables | yes | yes |
+
+**What this does and does not guarantee**
+
+- **Does:** role-level timeouts cancel long work even when the app forgets `SET LOCAL`; reader sessions start read-only; superuser/BYPASSRLS are refused at startup by `src/db/preflight.ts`; `dblink` / `postgres_fdw` presence fails preflight.
+- **Does not:** a non-superuser can still `SET default_transaction_read_only TO off` for their session. **SELECT-only grants** (and the gateway's `BEGIN READ ONLY`) remain the hard write backstop for readers. Preflight runs once at process start against the configured DB user.
+
 ## TLS notes
 
 - Set `PGSSLMODE` / Vault `sslmode` to `require` or `verify-full` in non-local environments.
@@ -35,8 +55,10 @@ Postgres grants in `docker/postgres/init/01-schema.sql` mirror this.
 3. `run_select` caps rows at `min(max_rows argument, policy max_rows)`: it appends `LIMIT` when missing and truncates the result, so a subquery `LIMIT` cannot skip the cap.
 4. Prefer connecting as `app_reader` for read paths so DB privileges backstop the agent.
 5. Read tools run in `BEGIN READ ONLY` with transaction-local `statement_timeout` / `lock_timeout` / `idle_in_transaction_session_timeout` from policy, and agent SQL uses the extended query protocol, so Postgres rejects writes and multi-statement strings even if the classifier misses them.
+6. DDL (`withClient`) now applies the same policy timeouts (session `SET` on the autocommit path, `SET LOCAL` when a principal transaction is open).
+7. Role-level `ALTER ROLE … SET` timeouts and `default_transaction_read_only` (see above) backstop the app when `SET LOCAL` is missing.
 
-> Defense in depth: agent policy is necessary but not sufficient — always use least-privilege DB roles.
+> Defense in depth: agent policy is necessary but not sufficient — always use least-privilege DB roles and apply `scripts/provision-roles.sql`.
 
 ## Principal propagation (JWT → RLS)
 
@@ -70,6 +92,8 @@ CREATE POLICY tenant_isolation ON orders
 
 - [ ] Vault (or cloud secret manager) — no long-lived passwords in env on shared hosts
 - [ ] TLS to Postgres and Vault
+- [ ] Apply `scripts/provision-roles.sql` (or equivalent) so agent roles are non-superuser, NOBYPASSRLS, timed, and reader is default read-only
+- [ ] Do not install `dblink` / `postgres_fdw` / untrusted PLs on agent databases (preflight refuses them)
 - [ ] Ship audit to immutable / SIEM store
 - [ ] Restrict who can set `PGGUARD_ROLE=admin|migrator`
 - [ ] Network isolation: agent host → DB/Vault only

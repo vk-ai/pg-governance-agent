@@ -22,4 +22,11 @@ export const RLS_SQL_FILES = [
   "docker/postgres/optional/rls-orders-by-employee.sql",
 ];
 
+/** Schema + seed + DB-native role controls (phase 2). ALTER ROLE is cluster-wide. */
+export const PHASE2_SQL_FILES = [
+  "docker/postgres/init/01-schema.sql",
+  "docker/postgres/init/02-seed.sql",
+  "docker/postgres/init/04-agent-roles.sql",
+];
+
 export const SET_KEY_SQL = `SELECT pgguard.set_rls_key(decode('${TEST_RLS_KEY_HEX}', 'hex'))`;

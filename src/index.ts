@@ -9,9 +9,10 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { createAppContext } from "./mcp/context.js";
+import { createAppContext, credsForPolicy } from "./mcp/context.js";
 import { handleTool, toolDefs } from "./mcp/tools.js";
 import { closePool } from "./db/pool.js";
+import { assertPreflight, tierFromAllow } from "./db/preflight.js";
 import { log } from "./utils/logger.js";
 
 async function main(): Promise<void> {
@@ -19,6 +20,20 @@ async function main(): Promise<void> {
   log("info", "pgguard_starting", {
     role: ctx.policy.roleName,
     db_user: ctx.policy.role.db_user,
+  });
+
+  // Fail closed: refuse to start if the DB role is superuser/BYPASSRLS, missing
+  // statement_timeout, wrong default_transaction_read_only for the tier, or if
+  // dblink/postgres_fdw are installed. Apply scripts/provision-roles.sql first.
+  const creds = await credsForPolicy(ctx);
+  const preflight = await assertPreflight(creds, {
+    tier: tierFromAllow(ctx.policy.role.allow),
+  });
+  ctx.preflight = preflight;
+  log("info", "pgguard_preflight_ok", {
+    db_user: preflight.db_user,
+    tier: preflight.tier,
+    checks: preflight.checks.map((c) => c.name),
   });
 
   const server = new Server(

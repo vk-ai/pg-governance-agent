@@ -7,6 +7,7 @@ import {
   withDmlTransaction,
   withReadOnlyTransaction,
 } from "../db/pool.js";
+import { tierFromAllow, type PreflightResult } from "../db/preflight.js";
 import {
   resolvePrincipal,
   gucsForPrincipal,
@@ -52,19 +53,19 @@ const bearerTokenProp = {
 
 function sessionOpts(ctx: AppContext, args: Record<string, unknown>): {
   principal: Principal | null;
-  withOpts: { sessionGucs?: Record<string, string> };
+  withOpts: { sessionGucs?: Record<string, string>; timeouts: AppContext["policy"]["readTxn"] };
   readOpts: { sessionGucs?: Record<string, string>; timeouts: AppContext["policy"]["readTxn"] };
   principalSub?: string;
 } {
   const timeouts = ctx.policy.readTxn;
   const principal = resolvePrincipal(args, ctx.policy.principalPropagation);
   if (!principal) {
-    return { principal: null, withOpts: {}, readOpts: { timeouts } };
+    return { principal: null, withOpts: { timeouts }, readOpts: { timeouts } };
   }
   const sessionGucs = gucsForPrincipal(principal, ctx.policy.principalPropagation);
   return {
     principal,
-    withOpts: { sessionGucs },
+    withOpts: { sessionGucs, timeouts },
     readOpts: { sessionGucs, timeouts },
     principalSub: principal.sub,
   };
@@ -473,6 +474,7 @@ export async function handleTool(
         assertCapability(ctx.policy, "whoami");
         const p = ctx.policy;
         const { principal } = sessionOpts(ctx, args);
+        const preflight: PreflightResult | null = ctx.preflight ?? null;
         return textResult({
           role: p.roleName,
           db_user: p.role.db_user,
@@ -500,6 +502,18 @@ export async function handleTool(
             require_jwt: p.principalPropagation.require_jwt,
             session_gucs: p.principalPropagation.session_gucs,
           },
+          db_preflight: preflight
+            ? {
+                ok: preflight.ok,
+                tier: preflight.tier,
+                checks: preflight.checks,
+                error: preflight.error,
+              }
+            : {
+                ok: null,
+                note: "preflight not run (server started without DB check, or whoami in unit tests)",
+                expected_tier: tierFromAllow(p.role.allow),
+              },
         });
       }
       default:
