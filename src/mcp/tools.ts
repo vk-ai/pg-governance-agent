@@ -18,16 +18,22 @@ import {
   listSchemas,
   listTables,
   describeTable,
-  enforceMaxRows,
+  capRows,
   effectiveMaxRows,
+  fetchCapped,
   runUserSql,
+  type CappedResult,
 } from "../db/queries.js";
 import {
   assertCapability,
+  checkSchemas,
   classifySql,
+  filterSchemas,
   isDdl,
   isDml,
+  isSchemaAllowed,
   isSelect,
+  stripExplain,
 } from "../policy/index.js";
 
 function textResult(data: unknown) {
@@ -51,23 +57,54 @@ const bearerTokenProp = {
   },
 };
 
+type TxnOpts = {
+  sessionGucs?: Record<string, string>;
+  timeouts: AppContext["policy"]["readTxn"];
+  searchPath?: readonly string[] | null;
+};
+
 function sessionOpts(ctx: AppContext, args: Record<string, unknown>): {
   principal: Principal | null;
-  withOpts: { sessionGucs?: Record<string, string>; timeouts: AppContext["policy"]["readTxn"] };
-  readOpts: { sessionGucs?: Record<string, string>; timeouts: AppContext["policy"]["readTxn"] };
+  withOpts: TxnOpts;
+  readOpts: TxnOpts;
   principalSub?: string;
 } {
   const timeouts = ctx.policy.readTxn;
+  const searchPath = ctx.policy.searchPath ?? undefined;
   const principal = resolvePrincipal(args, ctx.policy.principalPropagation);
   if (!principal) {
-    return { principal: null, withOpts: { timeouts }, readOpts: { timeouts } };
+    return { principal: null, withOpts: { timeouts, searchPath }, readOpts: { timeouts, searchPath } };
   }
   const sessionGucs = gucsForPrincipal(principal, ctx.policy.principalPropagation);
   return {
     principal,
-    withOpts: { sessionGucs, timeouts },
-    readOpts: { sessionGucs, timeouts },
+    withOpts: { sessionGucs, timeouts, searchPath },
+    readOpts: { sessionGucs, timeouts, searchPath },
     principalSub: principal.sub,
+  };
+}
+
+/** Schema guard; returns an error message or null. */
+function schemaDenied(ctx: AppContext, sql: string): string | null {
+  const g = checkSchemas(sql, ctx.policy.allowedSchemas);
+  return g.ok ? null : g.reason || "Schema not allowed";
+}
+
+function schemaArgDenied(ctx: AppContext, schema: string): string | null {
+  return isSchemaAllowed(schema, ctx.policy.allowedSchemas)
+    ? null
+    : `Schema '${schema}' is not allowed for this role (allowed_schemas: ${(ctx.policy.allowedSchemas || []).join(", ") || "(none)"})`;
+}
+
+function capsMeta(r: CappedResult, caps: { maxRows: number; maxResultBytes: number; maxCellBytes: number }) {
+  return {
+    truncated: r.truncated,
+    ...(r.truncated ? { truncated_by: r.truncatedBy } : {}),
+    ...(r.truncatedCells ? { truncated_cells: r.truncatedCells, truncated_columns: r.truncatedColumns } : {}),
+    result_bytes: r.resultBytes,
+    max_rows: caps.maxRows,
+    max_result_bytes: caps.maxResultBytes,
+    max_cell_bytes: caps.maxCellBytes,
   };
 }
 
@@ -83,7 +120,7 @@ export const toolDefs = [
   },
   {
     name: "list_schemas",
-    description: "List non-system schemas",
+    description: "List non-system schemas (only the role's allowed_schemas when configured)",
     inputSchema: {
       type: "object" as const,
       properties: { ...bearerTokenProp },
@@ -118,7 +155,8 @@ export const toolDefs = [
   },
   {
     name: "run_select",
-    description: "Run a single SELECT (max rows enforced; read-only role preferred)",
+    description:
+      "Run a single SELECT in a READ ONLY transaction. Only allowed_schemas may be referenced. Rows are capped at min(max_rows, policy max_rows) and by max_result_bytes / max_cell_bytes; the response says truncated: true when a cap applied.",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -223,7 +261,8 @@ export async function handleTool(
         assertCapability(ctx.policy, "introspect");
         const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const schemas = await withReadOnlyTransaction(creds, (c) => listSchemas(c), readOpts);
+        const all = await withReadOnlyTransaction(creds, (c) => listSchemas(c), readOpts);
+        const schemas = filterSchemas(all, ctx.policy.allowedSchemas, (s) => s);
         ctx.audit.append({
           tool: name,
           role,
@@ -236,9 +275,18 @@ export async function handleTool(
       case "list_tables": {
         assertCapability(ctx.policy, "introspect");
         const schema = typeof args.schema === "string" ? args.schema : undefined;
+        const denied = schema !== undefined ? schemaArgDenied(ctx, schema) : null;
+        if (denied) {
+          ctx.audit.append({ tool: name, role, ok: false, error: denied, detail: { schema } });
+          return errResult(denied);
+        }
         const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const tables = await withReadOnlyTransaction(creds, (c) => listTables(c, schema), readOpts);
+        const tables = filterSchemas(
+          await withReadOnlyTransaction(creds, (c) => listTables(c, schema), readOpts),
+          ctx.policy.allowedSchemas,
+          (t) => t.schema,
+        );
         ctx.audit.append({
           tool: name,
           role,
@@ -252,6 +300,11 @@ export async function handleTool(
         assertCapability(ctx.policy, "introspect");
         const schema = z.string().parse(args.schema);
         const table = z.string().parse(args.table);
+        const deniedSchema = schemaArgDenied(ctx, schema);
+        if (deniedSchema) {
+          ctx.audit.append({ tool: name, role, ok: false, error: deniedSchema, detail: { schema, table } });
+          return errResult(deniedSchema);
+        }
         const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
         const columns = await withReadOnlyTransaction(
@@ -278,27 +331,26 @@ export async function handleTool(
           ctx.audit.append({ tool: name, role, ok: false, error: msg, sqlPreview: sql });
           return errResult(msg);
         }
-        const limited = enforceMaxRows(sql, maxRows);
+        const denied = schemaDenied(ctx, sql);
+        if (denied) {
+          ctx.audit.append({ tool: name, role, ok: false, error: denied, sqlPreview: sql });
+          return errResult(denied);
+        }
+        const caps = { maxRows, maxResultBytes: ctx.policy.maxResultBytes, maxCellBytes: ctx.policy.maxCellBytes };
         const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const rows = await withReadOnlyTransaction(
-          creds,
-          async (c) => {
-            const r = await runUserSql(c, limited);
-            // LIMIT inside a subquery skips enforceMaxRows; cap the returned rows regardless.
-            return r.rows.slice(0, maxRows);
-          },
-          readOpts,
-        );
+        // Server-side cursor: FETCH up to max_rows+1 and stop at the byte budget.
+        const r = await withReadOnlyTransaction(creds, (c) => fetchCapped(c, sql, caps), readOpts);
+        const meta = capsMeta(r, caps);
         ctx.audit.append({
           tool: name,
           role,
           principal: principalSub,
           ok: true,
-          sqlPreview: limited,
-          detail: { rowCount: rows.length, maxRows },
+          sqlPreview: sql,
+          detail: { rowCount: r.rowCount, ...meta },
         });
-        return textResult({ rowCount: rows.length, rows });
+        return textResult({ rowCount: r.rowCount, ...meta, rows: r.rows });
       }
       case "run_dml": {
         assertCapability(ctx.policy, "dml");
@@ -316,6 +368,11 @@ export async function handleTool(
           ctx.audit.append({ tool: name, role, ok: false, error: msg, sqlPreview: sql });
           return errResult(msg);
         }
+        const dmlDenied = schemaDenied(ctx, sql);
+        if (dmlDenied) {
+          ctx.audit.append({ tool: name, role, ok: false, error: dmlDenied, sqlPreview: sql });
+          return errResult(dmlDenied);
+        }
         const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
         const maxAffectedRows = ctx.policy.maxAffectedRows;
@@ -323,6 +380,7 @@ export async function handleTool(
           const r = await withDmlTransaction(creds, sql, {
             sessionGucs: readOpts.sessionGucs,
             timeouts: ctx.policy.readTxn,
+            searchPath: readOpts.searchPath,
             maxAffectedRows,
             dryRun,
           });
@@ -378,6 +436,11 @@ export async function handleTool(
           const msg = cls.reason || `Expected DDL, got ${cls.statementClass}`;
           ctx.audit.append({ tool: name, role, ok: false, error: msg, sqlPreview: sql });
           return errResult(msg);
+        }
+        const ddlDenied = schemaDenied(ctx, sql);
+        if (ddlDenied) {
+          ctx.audit.append({ tool: name, role, ok: false, error: ddlDenied, sqlPreview: sql });
+          return errResult(ddlDenied);
         }
         if (dryRun) {
           ctx.audit.append({
@@ -437,6 +500,11 @@ export async function handleTool(
           ctx.audit.append({ tool: name, role, ok: false, error: cls.reason, sqlPreview: sql });
           return errResult(cls.reason || "Blocked");
         }
+        const explainDenied = schemaDenied(ctx, stripExplain(sql));
+        if (explainDenied) {
+          ctx.audit.append({ tool: name, role, ok: false, error: explainDenied, sqlPreview: sql });
+          return errResult(explainDenied);
+        }
         let explainSql = sql.trim();
         if (!/^explain/i.test(explainSql)) {
           explainSql = analyze ? `EXPLAIN (ANALYZE, BUFFERS) ${explainSql}` : `EXPLAIN ${explainSql}`;
@@ -446,7 +514,7 @@ export async function handleTool(
         // READ ONLY also means EXPLAIN ANALYZE of a DML statement is rejected by Postgres.
         const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const plan = await withReadOnlyTransaction(
+        const planRows = await withReadOnlyTransaction(
           creds,
           async (c) => {
             const r = await runUserSql(c, explainSql);
@@ -454,15 +522,22 @@ export async function handleTool(
           },
           readOpts,
         );
+        // Plans can be large (EXPLAIN VERBOSE on wide views); same byte caps as run_select.
+        const capped = capRows(planRows, {
+          maxRows: Math.max(planRows.length, 1),
+          maxResultBytes: ctx.policy.maxResultBytes,
+          maxCellBytes: ctx.policy.maxResultBytes,
+        });
+        const plan = capped.rows;
         ctx.audit.append({
           tool: name,
           role,
           principal: principalSub,
           ok: true,
           sqlPreview: explainSql,
-          detail: { analyze },
+          detail: { analyze, truncated: capped.truncated },
         });
-        return textResult({ plan });
+        return textResult(capped.truncated ? { plan, truncated: true, truncated_by: capped.truncatedBy } : { plan });
       }
       case "get_audit_tail": {
         assertCapability(ctx.policy, "audit_read");
@@ -487,6 +562,10 @@ export async function handleTool(
           require_confirm_ddl: p.requireConfirmDdl,
           allow_explain_analyze: p.allowExplainAnalyze,
           dual_control_ddl: p.dualControlDdl,
+          allowed_schemas: p.allowedSchemas,
+          search_path: p.searchPath,
+          max_result_bytes: p.maxResultBytes,
+          max_cell_bytes: p.maxCellBytes,
           read_transaction: {
             read_only: true,
             statement_timeout_ms: p.readTxn.statementTimeoutMs,

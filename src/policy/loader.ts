@@ -8,6 +8,7 @@ import {
 } from "../auth/principal.js";
 import type { ReadTxnOptions } from "../db/pool.js";
 import { log } from "../utils/logger.js";
+import { SCHEMA_IDENT_RE } from "./schemaGuard.js";
 
 /** Defaults used when policy.yaml does not set read-transaction timeouts. */
 export const DEFAULT_READ_TXN: Required<ReadTxnOptions> = {
@@ -15,6 +16,10 @@ export const DEFAULT_READ_TXN: Required<ReadTxnOptions> = {
   lockTimeoutMs: 2_000,
   idleInTransactionSessionTimeoutMs: 30_000,
 };
+
+/** Result caps used when policy.yaml does not set them. */
+export const DEFAULT_MAX_RESULT_BYTES = 1_048_576; // 1 MiB
+export const DEFAULT_MAX_CELL_BYTES = 65_536; // 64 KiB
 
 export type AgentRoleName = "reader" | "writer" | "migrator" | "admin" | string;
 
@@ -31,6 +36,49 @@ export interface EffectivePolicy {
   principalPropagation: PrincipalPropagationConfig;
   /** SET LOCAL timeouts for read tools (run inside BEGIN READ ONLY). */
   readTxn: Required<ReadTxnOptions>;
+  /** Schema allowlist; null = guard off (no allowed_schemas in policy). */
+  allowedSchemas: string[] | null;
+  /** search_path set in every transaction when the guard is on (subset of allowedSchemas). */
+  searchPath: string[] | null;
+  /** Result byte budget for run_select / explain_query (compact JSON). */
+  maxResultBytes: number;
+  /** Per-cell byte cap; longer values are truncated and reported. */
+  maxCellBytes: number;
+}
+
+function positiveInt(v: unknown, fallback: number): number {
+  const n = Number(v);
+  return Number.isInteger(n) && n > 0 ? n : fallback;
+}
+
+/**
+ * Resolve allowed_schemas / search_path for a role. Throws on invalid names or
+ * a search_path that would let unqualified names resolve outside the allowlist.
+ */
+export function resolveSchemaPolicy(
+  role: RolePolicy,
+  d: PolicyConfig["defaults"],
+  roleName = "?",
+): { allowedSchemas: string[] | null; searchPath: string[] | null } {
+  const allowed = role.allowed_schemas ?? d.allowed_schemas;
+  if (allowed === undefined || allowed === null) return { allowedSchemas: null, searchPath: null };
+  if (!Array.isArray(allowed)) throw new Error(`Role ${roleName}: allowed_schemas must be a list`);
+  for (const s of allowed) {
+    if (typeof s !== "string" || !SCHEMA_IDENT_RE.test(s)) {
+      throw new Error(`Role ${roleName}: invalid schema name in allowed_schemas: ${String(s)}`);
+    }
+  }
+  const sp = role.search_path ?? d.search_path ?? allowed.filter((s) => s !== "pg_catalog" && s !== "information_schema");
+  if (!Array.isArray(sp)) throw new Error(`Role ${roleName}: search_path must be a list`);
+  for (const s of sp) {
+    if (typeof s !== "string" || !SCHEMA_IDENT_RE.test(s)) {
+      throw new Error(`Role ${roleName}: invalid schema name in search_path: ${String(s)}`);
+    }
+    if (!allowed.includes(s)) {
+      throw new Error(`Role ${roleName}: search_path schema '${s}' is not in allowed_schemas`);
+    }
+  }
+  return { allowedSchemas: [...allowed], searchPath: [...sp] };
 }
 
 export function loadPolicyConfig(policyPath?: string): PolicyConfig {
@@ -66,6 +114,7 @@ export function resolveEffectivePolicy(
     },
     enabled: pp.enabled ?? DEFAULT_PRINCIPAL_PROPAGATION.enabled,
   };
+  const schemaPolicy = resolveSchemaPolicy(role, d, name);
   return {
     roleName: name,
     role,
@@ -86,6 +135,10 @@ export function resolveEffectivePolicy(
         d.idle_in_transaction_session_timeout_ms ??
         DEFAULT_READ_TXN.idleInTransactionSessionTimeoutMs,
     },
+    allowedSchemas: schemaPolicy.allowedSchemas,
+    searchPath: schemaPolicy.searchPath,
+    maxResultBytes: positiveInt(role.max_result_bytes ?? d.max_result_bytes, DEFAULT_MAX_RESULT_BYTES),
+    maxCellBytes: positiveInt(role.max_cell_bytes ?? d.max_cell_bytes, DEFAULT_MAX_CELL_BYTES),
   };
 }
 
@@ -119,6 +172,15 @@ export function validatePolicyFile(policyPath?: string): { ok: boolean; errors: 
       if (!Array.isArray(role.allow)) errors.push(`Role ${name}: allow must be array`);
       if (role.max_affected_rows !== undefined && !(Number.isInteger(role.max_affected_rows) && role.max_affected_rows >= 0)) {
         errors.push(`Role ${name}: max_affected_rows must be a non-negative integer`);
+      }
+      for (const k of ["max_result_bytes", "max_cell_bytes"] as const) {
+        const v = role[k];
+        if (v !== undefined && !(Number.isInteger(v) && v > 0)) errors.push(`Role ${name}: ${k} must be a positive integer`);
+      }
+      try {
+        resolveSchemaPolicy(role, cfg.defaults || ({} as PolicyConfig["defaults"]), name);
+      } catch (e) {
+        errors.push(e instanceof Error ? e.message : String(e));
       }
       for (const a of role.allow || []) {
         if (!requiredCaps.includes(a as Capability) && !["health","introspect","select","dml","ddl","explain","audit_read","whoami"].includes(a)) {
