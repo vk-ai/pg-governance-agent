@@ -1,6 +1,7 @@
 import pg from "pg";
 import type { DbCredentials } from "../secrets/types.js";
 import { log } from "../utils/logger.js";
+import { searchPathValue } from "../policy/schemaGuard.js";
 
 const { Pool } = pg;
 
@@ -114,6 +115,16 @@ export async function applyLocalTimeouts(
   }
 }
 
+/**
+ * Transaction-local search_path (phase 3). The schema guard assumes unqualified
+ * names resolve through exactly these schemas (plus implicit pg_catalog), so
+ * PgGuard sets it rather than trusting the role default.
+ */
+export async function applyLocalSearchPath(client: pg.PoolClient, schemas: readonly string[] | undefined | null): Promise<void> {
+  if (!schemas) return;
+  await client.query("SELECT set_config('search_path', $1, true)", [searchPathValue(schemas)]);
+}
+
 async function rollbackQuietly(client: pg.PoolClient): Promise<Error | undefined> {
   try {
     await client.query("ROLLBACK");
@@ -132,10 +143,17 @@ async function rollbackQuietly(client: pg.PoolClient): Promise<Error | undefined
  * Always rolls back (reads have nothing to commit). If ROLLBACK itself fails
  * the connection is destroyed instead of being returned to the pool.
  */
+export interface ReadTxnCallOptions {
+  sessionGucs?: Record<string, string>;
+  timeouts?: ReadTxnOptions;
+  /** SET LOCAL search_path (schema guard); omitted = role default. */
+  searchPath?: readonly string[] | null;
+}
+
 export async function withReadOnlyTransaction<T>(
   creds: DbCredentials,
   fn: (client: pg.PoolClient) => Promise<T>,
-  opts?: { sessionGucs?: Record<string, string>; timeouts?: ReadTxnOptions },
+  opts?: ReadTxnCallOptions,
 ): Promise<T> {
   return readOnlyTransactionOn(async () => (await getPool(creds)).connect(), fn, opts);
 }
@@ -144,7 +162,7 @@ export async function withReadOnlyTransaction<T>(
 export async function readOnlyTransactionOn<T>(
   connect: () => Promise<pg.PoolClient>,
   fn: (client: pg.PoolClient) => Promise<T>,
-  opts?: { sessionGucs?: Record<string, string>; timeouts?: ReadTxnOptions },
+  opts?: ReadTxnCallOptions,
 ): Promise<T> {
   const client = await connect();
   let releaseErr: Error | undefined;
@@ -152,6 +170,7 @@ export async function readOnlyTransactionOn<T>(
     await client.query("BEGIN READ ONLY");
     try {
       await applyLocalTimeouts(client, opts?.timeouts);
+      await applyLocalSearchPath(client, opts?.searchPath);
       if (opts?.sessionGucs && Object.keys(opts.sessionGucs).length > 0) {
         await applySessionGucs(client, opts.sessionGucs);
       }
@@ -169,6 +188,8 @@ export interface ClientOpts {
   sessionGucs?: Record<string, string>;
   /** Transaction-local timeouts (same GUCs as read/DML paths). Applied even on the autocommit path via SET, then reset. */
   timeouts?: ReadTxnOptions;
+  /** search_path for the statement (schema guard). Session SET + RESET on autocommit, SET LOCAL in a txn. */
+  searchPath?: readonly string[] | null;
 }
 
 /**
@@ -234,6 +255,10 @@ export async function clientOn<T>(
     let setNames: string[] = [];
     try {
       if (opts?.timeouts) setNames = await applySessionTimeouts(client, opts.timeouts);
+      if (opts?.searchPath) {
+        setNames.push("search_path");
+        await client.query("SELECT set_config('search_path', $1, false)", [searchPathValue(opts.searchPath)]);
+      }
       return await fn(client);
     } finally {
       if (setNames.length) await resetSessionTimeouts(client, setNames);
@@ -245,6 +270,7 @@ export async function clientOn<T>(
     await client.query("BEGIN");
     try {
       await applyLocalTimeouts(client, opts?.timeouts);
+      await applyLocalSearchPath(client, opts?.searchPath);
       await applySessionGucs(client, gucs!);
       const out = await fn(client);
       await client.query("COMMIT");
@@ -268,6 +294,8 @@ export interface DmlTxnOptions {
   dryRun?: boolean;
   /** Sample rows to return from a RETURNING clause (dry run only). */
   sampleRows?: number;
+  /** SET LOCAL search_path (schema guard). */
+  searchPath?: readonly string[] | null;
 }
 
 export interface DmlTxnResult {
@@ -319,6 +347,7 @@ export async function dmlTransactionOn(
     let finished = false;
     try {
       await applyLocalTimeouts(client, opts.timeouts);
+      await applyLocalSearchPath(client, opts.searchPath);
       if (opts.sessionGucs && Object.keys(opts.sessionGucs).length > 0) {
         await applySessionGucs(client, opts.sessionGucs);
       }

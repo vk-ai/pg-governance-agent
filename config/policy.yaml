@@ -32,6 +32,16 @@ defaults:
   statement_timeout_ms: 15000
   lock_timeout_ms: 2000
   idle_in_transaction_session_timeout_ms: 30000
+  # Phase 3 result caps for run_select / explain_query (compact JSON bytes).
+  # Rows are read through a server-side cursor (FETCH max_rows+1), so the cap
+  # holds even with LIMIT in a subquery; responses report truncated: true.
+  max_result_bytes: 1048576
+  max_cell_bytes: 65536
+  # Schemas agent SQL may reference (early deny + filtered list_schemas/list_tables).
+  # DB grants stay the guarantee. Roles may override; search_path (set per
+  # transaction) defaults to this list and must be a subset of it.
+  allowed_schemas:
+    - corp
 
 blocked_patterns:
   - multiple_statements
@@ -71,6 +81,8 @@ roles:
       - ddl
     max_rows: 100
     allow_explain_analyze: false
+    allowed_schemas: [corp]
+    max_result_bytes: 524288
 
   writer:
     description: Application writer — DML with confirmation
@@ -89,6 +101,7 @@ roles:
     max_affected_rows: 50
     require_confirm_dml: true
     allow_explain_analyze: false
+    allowed_schemas: [corp]
 
   migrator:
     description: Schema migrator — DDL with dual-control confirmation
