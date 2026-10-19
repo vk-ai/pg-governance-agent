@@ -51,6 +51,8 @@ function ctxFor(roleName: string, auditDir: string): AppContext {
   policy.readTxn = { ...policy.readTxn, statementTimeoutMs: 300 };
   // Tokens are always verified here; calls without one exercise the "no principal" path.
   policy.principalPropagation = { ...policy.principalPropagation, require_jwt: false };
+  // Pre-phase-4 suite: exercises caps/RLS, not approvals (covered in tests/phase4-*.test.ts).
+  policy.approvals = { ...policy.approvals, requiredFor: [] };
   return {
     secrets: { getDbCredentials: async (user?: string) => credsFor(user || "app_reader") },
     audit: new AuditLogger(auditDir),
