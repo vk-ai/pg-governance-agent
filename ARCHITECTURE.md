@@ -26,6 +26,7 @@ PgGuard is a **governance MCP server** that sits between an AI client (e.g. Curs
 |-----------|------|----------------|
 | MCP server | `src/index.ts`, `src/mcp/` | stdio tools, request routing |
 | Policy / RBAC | `config/policy.yaml`, `src/policy/` | Roles, capabilities, confirm gates |
+| Approvals (phase 4) | `src/approvals/`, `docker/postgres/optional/approval-ledger.sql` | Ed25519-signed, single-use, expiring, SQL-hash-bound approvals; approver CLI |
 | SQL classifier | `src/policy/classifier.ts` | Statement class + blocklist heuristics (`pgsql-ast-parser` + regex) |
 | Secrets | `src/secrets/` | Vault KV v2 or env fallback |
 | DB access | `src/db/` | `pg` pool, introspection helpers |
@@ -36,7 +37,7 @@ PgGuard is a **governance MCP server** that sits between an AI client (e.g. Curs
 
 1. Client calls an MCP tool (e.g. `run_select`).
 2. Agent resolves `PGGUARD_ROLE` → effective policy (capabilities, max rows, confirm flags).
-3. For SQL tools: classify statement → allow/deny → optional `confirm` / `dry_run`.
+3. For SQL tools: classify statement → allow/deny → optional `confirm` / `dry_run` → for real DML/DDL, verify and consume a human-signed approval (phase 4).
 4. Credentials fetched for the role’s `db_user` from Vault or env.
 5. Query runs via `node-postgres` (parameterized for introspection; user SQL is single-statement only).
 6. Result returned on MCP; audit event appended; structured log line on stderr.
@@ -54,7 +55,7 @@ PgGuard is a **governance MCP server** that sits between an AI client (e.g. Curs
 
 | Threat | Mitigation |
 |--------|------------|
-| Prompt injection → destructive SQL | Classifier allowlist; role caps; `confirm` for DML/DDL; dual-control flag for DDL |
+| Prompt injection → destructive SQL | Classifier allowlist; role caps; `confirm` for DML/DDL; out-of-band signed approval bound to the SQL hash (phase 4) |
 | Multi-statement / stacked queries | Rejected by classifier |
 | Privilege escalation (`SET ROLE`, GRANT) | Blocked patterns |
 | Secret leakage in repo | Vault / `.env` (gitignored); `.env.example` only |

@@ -11,7 +11,7 @@
     "build": "tsc",
     "mcp": "node dist/index.js",
     "dev": "tsx src/index.ts",
-    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage=false",
+    "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage=false --runInBand",
     "policy:check": "tsx src/policy/check.ts",
     "approvals": "tsx src/approvals/cli.ts"
   },

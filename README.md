@@ -28,8 +28,9 @@ PgGuard sits between an AI assistant and your PostgreSQL database. It enforces r
 | `db_health` | Ping + Postgres version |
 | `list_schemas` / `list_tables` / `describe_table` | Safe introspection, limited to the role's `allowed_schemas` |
 | `run_select` | `SELECT` only; allowed schemas only; capped by rows, bytes and cell size (`truncated: true` when a cap applied) |
-| `run_dml` | Data changes — requires `confirm: true`; `dry_run: true` previews the affected row count; capped by `max_affected_rows` |
-| `run_ddl` | Schema changes — requires `confirm`; optional `dry_run` |
+| `run_dml` | Data changes — requires `confirm: true` plus a human-signed approval (`approval_id` / `approval_token`) when policy requires it; `dry_run: true` previews the affected row count (no approval needed); capped by `max_affected_rows` |
+| `run_ddl` | Schema changes — requires `confirm` plus an approval when policy requires it; optional `dry_run` |
+| `request_approval` | Queue one exact DML/DDL statement for a human approver (returns `approval_id` + SQL sha256; DML includes a dry-run row count) |
 | `explain_query` | `EXPLAIN` (`ANALYZE` gated by policy) |
 | `get_audit_tail` | Recent audit events |
 | `whoami` | Effective role + policy (+ optional JWT principal) |
@@ -176,6 +177,7 @@ Demo passwords live only in `.env.example` and Compose init scripts. **Never com
 | `npm run mcp` | Start stdio MCP server |
 | `npm test` | Unit tests (+ live Postgres tests when `PGGUARD_IT_DATABASE_URL` is set) |
 | `npm run policy:check` | Validate `config/policy.yaml` |
+| `npm run approvals -- <cmd>` | Approver CLI: `keygen`, `list`, `show`, `approve`, `deny` (needs the private key; run it outside the server's environment) |
 
 ---
 
@@ -244,6 +246,88 @@ locally.
 
 ---
 
+## Out-of-band approvals (phase 4)
+
+Learning project: this shows one way to make "a human approved this exact statement" something
+the gateway can check, instead of trusting the agent's `confirm: true`. It has not been used with
+a real change-management system.
+
+**Flow**
+
+1. The agent calls `request_approval` with `tool` (`run_dml` / `run_ddl`) and the exact SQL. PgGuard
+   classifies it, runs the schema guard, does a rolled-back dry run for DML, and writes
+   `data/approvals/pending/<approval_id>.json`. It returns `approval_id` and the SQL's sha256.
+2. A human, in a separate session that holds the Ed25519 **private** key, reviews and approves:
+   ```bash
+   npm run approvals -- keygen ~/.pgguard-approver          # once; give the server approver.pub
+   npm run approvals -- list
+   npm run approvals -- show <approval_id>                   # SQL, hash, dry-run row count, reason
+   PGGUARD_APPROVAL_PRIVATE_KEY_FILE=~/.pgguard-approver/approver.key \
+     npm run approvals -- approve <approval_id> --approver alice --ttl 600
+   ```
+   (`deny <approval_id> --approver alice --note "…"` refuses it.)
+3. The agent retries `run_dml` / `run_ddl` with the same SQL, `confirm: true` and `approval_id`
+   (or the printed `approval_token`).
+
+**What the server checks** (`src/approvals/token.ts`, `src/approvals/gate.ts`), before the statement runs:
+
+- **Signed out of band.** The token is `pga1.<claims>.<Ed25519 signature>`. The server holds only the
+  public key (`PGGUARD_APPROVAL_PUBLIC_KEY` or `PGGUARD_APPROVAL_PUBLIC_KEY_FILE`). It refuses to start if
+  any `PGGUARD_APPROVAL_PRIVATE_KEY*` variable is in its environment.
+- **Bound to the SQL.** The token carries `sha256` of the SQL exactly as submitted. Any byte change,
+  including whitespace, needs a new approval. It is also bound to the tool, PgGuard role, DB user,
+  database name and the JWT `sub` (null when there is no principal). All of these come from the live
+  call, never from the token.
+- **Expiring.** `exp - iat` must be ≤ `approvals.max_ttl_seconds` (900 in the shipped policy). Expiry has no
+  grace period; `clock_skew_seconds` (30) only tolerates an approver clock running ahead for `iat`.
+- **Single use.** Each token has a random 128-bit `jti`, recorded in a ledger:
+  - `ledger: file` (default): `data/approvals/used/<jti>` created with `O_EXCL`, so two processes on
+    one host cannot both use it. It is spent before the statement runs.
+  - `ledger: postgres`: `docker/postgres/optional/approval-ledger.sql` installs `pgguard.consume_approval()`,
+    a SECURITY DEFINER function writing to a table agent roles cannot read or write. For `run_dml` it runs
+    inside the DML transaction, so the approval is spent only if the write commits. It also rejects a
+    token whose `exp` has passed by the **database** clock.
+- **Row cap.** The approver can set `--max-rows` (DML defaults to the dry-run count they were shown). The run
+  uses `min(policy max_affected_rows, approved max)`.
+- **No self-approval.** `approver` must differ from the requesting `sub`.
+- **Fail closed.** With `required_for: [dml, ddl]` (shipped default) and no public key configured, real runs are
+  refused. `dry_run` never needs an approval. `whoami` shows `approvals.public_key_configured`.
+
+**Tests:** `tests/phase4-approvals.test.ts` (40 offline) and `tests/phase4-approvals.integration.test.ts`
+(8 live, Postgres 17): end to end request → approve → run once → replay refused; Postgres ledger replay;
+cap rollback leaves the approval unspent; approver cap of 0 rolls back a 1-row update; wrong-SQL and
+wrong-database tokens never reach the DB; agent roles get `42501` on the ledger table; the DB clock rejects an
+expired consume; DDL approved once; a writer's token refused for the migrator role.
+
+**What is real vs. not**
+
+- Real: Ed25519 signing and verification (`node:crypto`, no new dependencies), SQL/scope binding, expiry,
+  both ledgers, the CLI, live Postgres tests.
+- Not built: no Slack/email/ticket integration, no web UI, no multi-approver quorum, no key rotation or
+  revocation list. The request queue is a local directory, so the agent host and the approver must share it,
+  or the approver passes the token back by hand.
+
+**Limits (honest)**
+
+- `approver` is a name the key holder types. Anyone with the private key can approve as anyone. One key
+  per approver and a revocation list are not implemented.
+- The file ledger is per host. Two PgGuard hosts with separate `data/` directories could each accept the
+  same token once. Use `ledger: postgres` when more than one server can reach the database.
+- Burn then run: with the file ledger (and for all DDL), the approval is spent before the statement. If the
+  statement then fails, a new approval is needed. DDL may run in autocommit, so it cannot share a
+  transaction with the ledger.
+- An agent that calls `pgguard.consume_approval()` directly can burn approvals (deny itself). It cannot
+  create one. The schema guard also blocks the `pgguard` schema for roles limited to `corp`.
+- The approver sees the SQL text and a dry-run count from one moment in time. Data can change before the
+  approved run, and the row cap is the backstop for that.
+- Existing pre-phase-4 live suites (`dml-preview`, `read-txn`) set `requiredFor: []` because they test caps
+  and RLS, not approvals.
+- `npm test` now runs Jest with `--runInBand`. Live suites run `ALTER ROLE` (cluster-wide) in their setup,
+  and in parallel one suite could reset another's `statement_timeout` (seen once in six parallel runs as a
+  phase 2 timeout). In-band, the full suite took about 7 s locally.
+
+---
+
 ## Security notes (short)
 
 **Phase 1 security fixes (this is a learning project; the threat model and limits are below).**
@@ -282,7 +366,7 @@ What changed, and why:
   - 200 KB text and bytea cells are cut to 64 KiB;
   - neither `max_rows: 1e9` nor a `LIMIT` in a subquery raises the cap.
 
-Still true / not fixed yet (phases 4–5):
+Still true / not fixed yet (phase 5 remains; phase 4 approvals are described above):
 
 - **The schema guard is a UX layer and early deny, not the boundary.** DB grants are the boundary. Gaps the guard does not cover:
   - string-to-OID casts (`'hr.t'::regclass`, `to_regclass`) and size/metadata functions can show that an object *exists*;
@@ -293,7 +377,7 @@ Still true / not fixed yet (phases 4–5):
 
 - The token is still a tool argument. It must be signed, but an agent holding several users' tokens can pick among them.
 - The HMAC key is static per deployment, with no expiry or session binding; an agent can read its *own* MAC. Key rotation is manual (`pgguard.set_rls_key`). Avoid `log_statement=all` / parameter logging, which would record MACs.
-- Function blocking is a denylist; a new or extension function with side effects is not caught. A non-superuser can still `SET default_transaction_read_only TO off` — **grants** and `BEGIN READ ONLY` remain the write hard-stop for readers. `confirm:true` is still agent-supplied, not human approval (phase 4). No DB host allowlist, tamper-evident audit or CI against Postgres (phase 5).
+- Function blocking is a denylist; a new or extension function with side effects is not caught. A non-superuser can still `SET default_transaction_read_only TO off` — **grants** and `BEGIN READ ONLY` remain the write hard-stop for readers. `confirm:true` alone is agent-supplied; phase 4 adds signed out-of-band approvals on top (see above). No DB host allowlist, tamper-evident audit or CI against Postgres (phase 5).
 - Old RLS policies that read `current_setting('app.user_id')` directly are still spoofable at the DB layer; move them to `pgguard.current_user_id()`.
 
 Also: use least-privilege DB roles, keep DML/DDL behind `confirm`, ship `data/audit/` off the box, and treat Compose Vault as dev-only.
