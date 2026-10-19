@@ -39,6 +39,12 @@ Postgres grants in `docker/postgres/init/01-schema.sql` mirror this.
 - **Does:** role-level timeouts cancel long work even when the app forgets `SET LOCAL`; reader sessions start read-only; superuser/BYPASSRLS are refused at startup by `src/db/preflight.ts`; `dblink` / `postgres_fdw` presence fails preflight.
 - **Does not:** a non-superuser can still `SET default_transaction_read_only TO off` for their session. **SELECT-only grants** (and the gateway's `BEGIN READ ONLY`) remain the hard write backstop for readers. Preflight runs once at process start against the configured DB user.
 
+### Result caps and schema allowlist: limits (phase 3)
+
+- Byte caps limit what the agent receives. A single large cell still crosses the wire in full before it is cut, bounded by `statement_timeout` and Postgres's 1 GB field limit. Plans that sort, hash or aggregate do their full work before the first row.
+- The guard does not cover: string-to-OID casts (`'hr.t'::regclass`, `to_regclass`) and catalog-metadata functions that reveal whether an object exists; temp tables (`pg_temp` is searched before the path). DB grants cover both.
+- Still pending: real out-of-band approvals (phase 4); DB host allowlist, tamper-evident audit and CI against Postgres (phase 5).
+
 ## TLS notes
 
 - Set `PGSSLMODE` / Vault `sslmode` to `require` or `verify-full` in non-local environments.
@@ -52,7 +58,8 @@ Postgres grants in `docker/postgres/init/01-schema.sql` mirror this.
    - Single-statement enforcement
    - Statement-class allowlist (SELECT / DML / DDL / EXPLAIN)
    - Blocklist: `COPY`, `INTO OUTFILE`, `SET ROLE`, `GRANT`/`REVOKE`, user/role DDL, and dangerous functions found by walking the SQL AST plus a quote-aware lexer (`set_config`, `dblink*`, `*fdw*`, `pg_terminate_backend`, `pg_cancel_backend`, `pg_advisory*`, `pg_sleep*`, `pg_read_file`, `lo_*`, …). Quoted and schema-qualified names are caught. This is a denylist and a second layer only.
-3. `run_select` caps rows at `min(max_rows argument, policy max_rows)`: it appends `LIMIT` when missing and truncates the result, so a subquery `LIMIT` cannot skip the cap.
+3. `run_select` caps rows at `min(max_rows argument, policy max_rows)` (phase 1) and, since phase 3, reads them through a server-side cursor (`DECLARE … CURSOR FOR <sql>`, then `FETCH` up to `max_rows + 1`). The SQL text is not rewritten. A subquery `LIMIT` or a huge `max_rows` cannot raise the cap. A byte budget (`max_result_bytes`) and a per-cell cap (`max_cell_bytes`) also apply. Responses say `truncated: true` and give `truncated_by`.
+8. **Schema allowlist (phase 3).** `allowed_schemas` per role. `src/policy/schemaGuard.ts` walks the AST and refuses non-allowed schema-qualified relations, functions, types and DDL targets, plus unqualified `pg_*` relations (which resolve to `pg_catalog`), SQL-in-a-string built-ins (`query_to_xml`, `table_to_xml`, `ts_stat`, `crosstab`, …) and SQL it cannot parse. `search_path` is set per transaction to the allowlist. Introspection tools are filtered. This is an early deny with a clear message: **GRANTs are the guarantee.** The live tests show a grant-less schema is refused by Postgres with the guard turned off. Keep `allowed_schemas` and GRANTs in sync, because nothing generates one from the other yet.
 4. Prefer connecting as `app_reader` for read paths so DB privileges backstop the agent.
 5. Read tools run in `BEGIN READ ONLY` with transaction-local `statement_timeout` / `lock_timeout` / `idle_in_transaction_session_timeout` from policy, and agent SQL uses the extended query protocol, so Postgres rejects writes and multi-statement strings even if the classifier misses them.
 6. DDL (`withClient`) now applies the same policy timeouts (session `SET` on the autocommit path, `SET LOCAL` when a principal transaction is open).
@@ -93,6 +100,8 @@ CREATE POLICY tenant_isolation ON orders
 - [ ] Vault (or cloud secret manager) — no long-lived passwords in env on shared hosts
 - [ ] TLS to Postgres and Vault
 - [ ] Apply `scripts/provision-roles.sql` (or equivalent) so agent roles are non-superuser, NOBYPASSRLS, timed, and reader is default read-only
+- [ ] Set `allowed_schemas` per role to match the schemas you GRANT (USAGE/SELECT); grant nothing else
+- [ ] Tune `max_rows` / `max_result_bytes` / `max_cell_bytes` to what an agent should ever see in one call
 - [ ] Do not install `dblink` / `postgres_fdw` / untrusted PLs on agent databases (preflight refuses them)
 - [ ] Ship audit to immutable / SIEM store
 - [ ] Restrict who can set `PGGUARD_ROLE=admin|migrator`

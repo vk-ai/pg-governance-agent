@@ -26,8 +26,8 @@ PgGuard sits between an AI assistant and your PostgreSQL database. It enforces r
 | Tool | Purpose |
 |------|---------|
 | `db_health` | Ping + Postgres version |
-| `list_schemas` / `list_tables` / `describe_table` | Safe introspection |
-| `run_select` | `SELECT` only, row-capped |
+| `list_schemas` / `list_tables` / `describe_table` | Safe introspection, limited to the role's `allowed_schemas` |
+| `run_select` | `SELECT` only; allowed schemas only; capped by rows, bytes and cell size (`truncated: true` when a cap applied) |
 | `run_dml` | Data changes — requires `confirm: true`; `dry_run: true` previews the affected row count; capped by `max_affected_rows` |
 | `run_ddl` | Schema changes — requires `confirm`; optional `dry_run` |
 | `explain_query` | `EXPLAIN` (`ANALYZE` gated by policy) |
@@ -257,18 +257,43 @@ What changed, and why:
 - **Row cap the agent can't raise.** `run_select` uses `min(max_rows, policy max_rows)` and truncates returned rows, so a `LIMIT` inside a subquery no longer skips the cap.
 - **TLS.** `sslmode=verify-ca` now validates the certificate chain (it used to set `rejectUnauthorized:false`); `verify-full` also checks the hostname; unknown modes are refused.
 
-**Phase 2 — DB-native baseline (this PR):**
+**Phase 2 — DB-native baseline:**
 
 - `docker/postgres/init/04-agent-roles.sql` + `scripts/provision-roles.sql`: `app_reader` gets `default_transaction_read_only=on`, role-level `statement_timeout` / `lock_timeout` / `idle_in_transaction_session_timeout`, `search_path=corp`, `NOBYPASSRLS`, connection limits; writer/migrator get timeouts without read-only; `REVOKE CREATE, USAGE ON SCHEMA public FROM PUBLIC`; `FORCE ROW LEVEL SECURITY` on `corp` tables.
 - `src/db/preflight.ts`: on MCP startup, refuse to start if the connected role is superuser/BYPASSRLS, `statement_timeout` is 0, read-only default does not match the tier, or `dblink`/`postgres_fdw` is installed. `whoami` exposes the result under `db_preflight`.
 - DDL path (`withClient`) applies policy timeouts (previously unset).
 - Live PG17 tests: writes via `WITH … DELETE` / `nextval` fail with the classifier bypassed; role timeout cancels `pg_sleep` with no app `SET LOCAL`; preflight rejects a superuser.
 
-Still true / not fixed yet (phases 3–5):
+**Phase 3: allowed schemas and row/byte result caps (this PR):**
+
+- `allowed_schemas` (defaults + per role, `corp` in the shipped policy) and an optional `search_path` (defaults to the allowlist; must be a subset of it). `src/policy/schemaGuard.ts` parses the SQL and refuses, before any DB call:
+  - schema-qualified relations outside the list (FROM, JOIN, subqueries, CTE bodies, UNION branches, LATERAL, INSERT/UPDATE/DELETE targets, DDL names);
+  - unqualified `pg_*` relations. Postgres searches `pg_catalog` first, and every `pg_catalog` relation is named `pg_*`;
+  - qualified functions, types and column refs in other schemas (built-in `pg_catalog` functions are fine);
+  - built-ins that run SQL from a string (`query_to_xml`, `table_to_xml`, `ts_stat`, `crosstab`, …);
+  - SQL the parser cannot read (fail closed).
+  It runs on `run_select`, `explain_query`, `run_dml` and `run_ddl`. `list_schemas` / `list_tables` are filtered, and `list_tables` / `describe_table` refuse other schemas. PgGuard also sets `search_path` per transaction, so unqualified names resolve the way the guard assumes.
+- **Result caps.** `run_select` no longer appends `LIMIT` to the SQL text. It runs `DECLARE pgguard_result NO SCROLL CURSOR FOR <sql>` inside the READ ONLY transaction and `FETCH`es batches of 50 until it has `max_rows + 1` rows, so the extra row shows the result was cut. It also stops at `max_result_bytes`, measured as compact JSON (default 1 MiB, reader 512 KiB). Cells over `max_cell_bytes` (default 64 KiB) are cut: text on a UTF-8 boundary, `bytea` returned as `\x…` hex, `json` as cut text. The response reports `truncated`, `truncated_by` (`rows` / `bytes` / `cells`), `truncated_cells`, `truncated_columns` and `result_bytes`. `max_rows` is still `min(argument, policy)`. `explain_query` output gets the same byte budget.
+- `whoami` shows `allowed_schemas`, `search_path`, `max_result_bytes` and `max_cell_bytes`.
+- Live PG17 tests:
+  - a schema with no grants is refused by Postgres (`42501`) with the guard turned off;
+  - a schema that is granted but not allowlisted is refused by the guard and readable with the guard off, so the two layers are independent;
+  - 10k-row and wide-row tables are cut by rows and by bytes;
+  - 200 KB text and bytea cells are cut to 64 KiB;
+  - neither `max_rows: 1e9` nor a `LIMIT` in a subquery raises the cap.
+
+Still true / not fixed yet (phases 4–5):
+
+- **The schema guard is a UX layer and early deny, not the boundary.** DB grants are the boundary. Gaps the guard does not cover:
+  - string-to-OID casts (`'hr.t'::regclass`, `to_regclass`) and size/metadata functions can show that an object *exists*;
+  - temp tables (`pg_temp`) are searched before the path;
+  - any SQL the parser cannot read is refused, which is stricter than Postgres. Some valid queries (`TABLE t`, `SELECT … FROM ONLY t`, `DELETE … USING`, some DDL) now need rewriting for roles with an allowlist. Leave `allowed_schemas` unset to turn the guard off.
+- **Byte caps apply to what the agent receives, not to what crosses the wire.** Each cell is fetched in full before it is cut. That is bounded by `statement_timeout` and Postgres's 1 GB field limit. Plans with Sort/Hash/aggregates still compute their full input before the first `FETCH`.
+- Schema allowlists in YAML and GRANTs in the DB can drift. Nothing generates one from the other yet.
 
 - The token is still a tool argument. It must be signed, but an agent holding several users' tokens can pick among them.
 - The HMAC key is static per deployment, with no expiry or session binding; an agent can read its *own* MAC. Key rotation is manual (`pgguard.set_rls_key`). Avoid `log_statement=all` / parameter logging, which would record MACs.
-- Function blocking is a denylist; a new or extension function with side effects is not caught. A non-superuser can still `SET default_transaction_read_only TO off` — **grants** and `BEGIN READ ONLY` remain the write hard-stop for readers. No schema allowlist or byte/cell cap yet (phase 3). `confirm:true` is still agent-supplied, not human approval (phase 4). No DB host allowlist, tamper-evident audit or CI against Postgres (phase 5).
+- Function blocking is a denylist; a new or extension function with side effects is not caught. A non-superuser can still `SET default_transaction_read_only TO off` — **grants** and `BEGIN READ ONLY` remain the write hard-stop for readers. `confirm:true` is still agent-supplied, not human approval (phase 4). No DB host allowlist, tamper-evident audit or CI against Postgres (phase 5).
 - Old RLS policies that read `current_setting('app.user_id')` directly are still spoofable at the DB layer; move them to `pgguard.current_user_id()`.
 
 Also: use least-privilege DB roles, keep DML/DDL behind `confirm`, ship `data/audit/` off the box, and treat Compose Vault as dev-only.

@@ -36,6 +36,14 @@ export interface RolePolicy {
   statement_timeout_ms?: number;
   lock_timeout_ms?: number;
   idle_in_transaction_session_timeout_ms?: number;
+  /** Schemas this role may reference (gateway early-deny; DB grants are the guarantee). Omit to disable the guard. */
+  allowed_schemas?: string[];
+  /** search_path PgGuard sets in each transaction; must be a subset of allowed_schemas. Defaults to allowed_schemas. */
+  search_path?: string[];
+  /** run_select / explain_query: total result budget (compact JSON bytes). */
+  max_result_bytes?: number;
+  /** Per-cell cap; longer text/bytea/json values are cut and reported. */
+  max_cell_bytes?: number;
 }
 
 export interface PrincipalPropagationYaml {
@@ -62,6 +70,10 @@ export interface PolicyConfig {
     statement_timeout_ms?: number;
     lock_timeout_ms?: number;
     idle_in_transaction_session_timeout_ms?: number;
+    allowed_schemas?: string[];
+    search_path?: string[];
+    max_result_bytes?: number;
+    max_cell_bytes?: number;
   };
   blocked_patterns: string[];
   dangerous_functions: string[];
