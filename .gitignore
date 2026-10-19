@@ -11,3 +11,4 @@ coverage/
 *.key
 .vault-token
 tmp/
+data/approvals/

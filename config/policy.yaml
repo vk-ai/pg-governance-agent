@@ -18,6 +18,20 @@ principal_propagation:
   # When set, PgGuard also sets app.user_id_mac so RLS can reject a rewritten app.user_id.
   rls_hmac_key_env: PGGUARD_RLS_HMAC_KEY
 
+# Phase 4: out-of-band approvals. Real (non-dry-run) run_dml / run_ddl calls need an
+# Ed25519-signed token minted by a human with `npm run approvals -- approve <id>`.
+# The server holds only the public key; tokens are single-use, expire, and are bound
+# to the exact SQL text (sha256), tool, role, DB user, database and JWT sub.
+# Fails closed: if approvals are required and no public key is configured, real runs
+# are refused. dry_run never needs an approval.
+approvals:
+  required_for: [dml, ddl]
+  public_key_env: PGGUARD_APPROVAL_PUBLIC_KEY   # PEM text, or PGGUARD_APPROVAL_PUBLIC_KEY_FILE=<path>
+  max_ttl_seconds: 900
+  clock_skew_seconds: 30
+  ledger: file          # or postgres (apply docker/postgres/optional/approval-ledger.sql)
+  # dir: data/approvals # request queue + file ledger (default; PGGUARD_APPROVALS_DIR overrides)
+
 defaults:
   max_rows: 100
   # run_dml: statements touching more rows than this are rolled back; dry_run reports the count.

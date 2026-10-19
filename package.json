@@ -1,7 +1,7 @@
 {
   "name": "pg-governance-agent",
   "version": "1.0.0",
-  "description": "PgGuard Agent — corporate Postgres governance MCP server with RBAC, Vault secrets, and audit",
+  "description": "PgGuard Agent \u2014 corporate Postgres governance MCP server with RBAC, Vault secrets, and audit",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
@@ -12,7 +12,8 @@
     "mcp": "node dist/index.js",
     "dev": "tsx src/index.ts",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage=false",
-    "policy:check": "tsx src/policy/check.ts"
+    "policy:check": "tsx src/policy/check.ts",
+    "approvals": "tsx src/approvals/cli.ts"
   },
   "keywords": [
     "postgres",

@@ -44,6 +44,27 @@ export interface RolePolicy {
   max_result_bytes?: number;
   /** Per-cell cap; longer text/bytea/json values are cut and reported. */
   max_cell_bytes?: number;
+  /** Phase 4: override approvals.required_for for this role ([] turns approvals off for it). */
+  approvals_required_for?: ApprovalKind[];
+}
+
+/** Statement kinds that can require an out-of-band approval. */
+export type ApprovalKind = "dml" | "ddl";
+
+/** Phase 4 `approvals:` block in policy.yaml. */
+export interface ApprovalsYaml {
+  /** Real (non-dry-run) run_dml / run_ddl calls need a signed approval token. */
+  required_for?: ApprovalKind[];
+  /** Env var with the approver's Ed25519 public key (PEM). `<env>_FILE` may point at a PEM file instead. */
+  public_key_env?: string;
+  /** Longest lifetime (exp - iat) the server accepts. */
+  max_ttl_seconds?: number;
+  /** Tolerated approver clock lead for iat (expiry gets no grace). */
+  clock_skew_seconds?: number;
+  /** Where single-use jtis are recorded: file (default) or postgres (pgguard.consume_approval). */
+  ledger?: "file" | "postgres";
+  /** Request queue + file ledger directory. */
+  dir?: string;
 }
 
 export interface PrincipalPropagationYaml {
@@ -58,6 +79,7 @@ export interface PrincipalPropagationYaml {
 
 export interface PolicyConfig {
   version: number;
+  approvals?: ApprovalsYaml;
   principal_propagation?: PrincipalPropagationYaml;
   defaults: {
     max_rows: number;
