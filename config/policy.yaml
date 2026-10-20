@@ -32,6 +32,37 @@ approvals:
   ledger: file          # or postgres (apply docker/postgres/optional/approval-ledger.sql)
   # dir: data/approvals # request queue + file ledger (default; PGGUARD_APPROVALS_DIR overrides)
 
+# Phase 5: DB network allowlist, checked before every connection (and at startup).
+# PgGuard resolves the credential host, checks the name and every resolved address,
+# then connects to the checked address (DNS pinning) and verifies the TLS certificate
+# against the original hostname. Non-loopback hosts must use sslmode=verify-full
+# (set PGSSLROOTCERT / Vault `sslrootcert` to your CA bundle). Link-local and
+# unspecified addresses (169.254.0.0/16, fe80::/10, 0.0.0.0/8, ::) are always refused.
+# This is defense in depth: real egress control is NetworkPolicy / security groups
+# plus pg_hba.conf (see deploy/networkpolicy.yaml and the README).
+network:
+  allowed_db_hosts:      # exact names, '*.suffix', IP literals or CIDRs
+    - localhost
+    - 127.0.0.1
+    - ::1
+    # - pg-primary.corp.internal
+    # - "*.rds.amazonaws.com"
+  # allowed_db_cidrs: [10.20.0.0/16]   # optional: resolved addresses must be inside these
+  require_sslmode: verify-full
+  # Local demo only: allow sslmode=disable when every resolved address is loopback.
+  # Set to false in any shared or production deployment.
+  plaintext_loopback_ok: true
+  pin_resolved_ip: true
+
+# Phase 5: tamper-evident audit. Each line in data/audit/events.jsonl carries seq,
+# prev and hash (sha256, or HMAC-SHA256 when the key env var is set). The server
+# refuses to start if the existing log fails verification; `npm run audit:verify`
+# finds the first bad line and prints the head hash to store elsewhere.
+audit:
+  hash_chain: true
+  hmac_key_env: PGGUARD_AUDIT_HMAC_KEY   # hex, >= 32 bytes; keep it off the agent's host if you can
+  verify_on_start: true
+
 defaults:
   max_rows: 100
   # run_dml: statements touching more rows than this are rolled back; dry_run reports the count.
@@ -88,11 +119,12 @@ roles:
       - introspect
       - select
       - explain
-      - audit_read
       - whoami
+    # Phase 5: audit_read removed from reader (the audit log holds other users' SQL).
     deny:
       - dml
       - ddl
+      - audit_read
     max_rows: 100
     allow_explain_analyze: false
     allowed_schemas: [corp]

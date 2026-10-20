@@ -268,7 +268,7 @@ export const toolDefs = [
   },
   {
     name: "get_audit_tail",
-    description: "Return last N append-only audit events",
+    description: "Return last N hash-chained audit events (needs audit_read; not granted to reader by default)",
     inputSchema: {
       type: "object" as const,
       properties: {
@@ -715,6 +715,20 @@ export async function handleTool(
             ledger: p.approvals.ledger,
             max_ttl_seconds: p.approvals.maxTtlSeconds,
             private_key_env_in_server: privateKeyInServerEnv(),
+          },
+          network: {
+            enforced: p.network?.enforced ?? false,
+            allowed_db_hosts: p.network?.allowedDbHosts ?? [],
+            allowed_db_cidrs: p.network?.allowedDbCidrs ?? [],
+            require_sslmode: p.network?.enforced ? p.network.requireSslmode : null,
+            plaintext_loopback_ok: p.network?.plaintextLoopbackOk ?? false,
+            pin_resolved_ip: p.network?.pinResolvedIp ?? false,
+            last_decision: ctx.network ?? null,
+          },
+          audit: {
+            hash_chain: ctx.audit.hashChain,
+            alg: ctx.audit.alg,
+            file: ctx.audit.filePath,
           },
           allowed_schemas: p.allowedSchemas,
           search_path: p.searchPath,

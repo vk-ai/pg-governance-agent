@@ -67,6 +67,30 @@ export interface ApprovalsYaml {
   dir?: string;
 }
 
+/** Phase 5 `network:` block in policy.yaml. */
+export interface NetworkYaml {
+  /** Host names (exact or `*.suffix`), IP literals or CIDRs the credential host must match. */
+  allowed_db_hosts?: string[];
+  /** Optional: every address the host resolves to must be inside one of these CIDRs. */
+  allowed_db_cidrs?: string[];
+  /** Only verify-full is accepted. */
+  require_sslmode?: "verify-full";
+  /** Allow a weaker sslmode when every resolved address is loopback (local dev only). */
+  plaintext_loopback_ok?: boolean;
+  /** Connect to the checked address, not a fresh DNS answer (default true). */
+  pin_resolved_ip?: boolean;
+}
+
+/** Phase 5 `audit:` block in policy.yaml. */
+export interface AuditYaml {
+  /** Hash-chain audit lines (default true). */
+  hash_chain?: boolean;
+  /** Env var with an HMAC key (hex, >= 32 bytes) for the chain; without it the chain is plain sha256. */
+  hmac_key_env?: string;
+  /** Refuse to start when the existing audit file fails verification (default true). */
+  verify_on_start?: boolean;
+}
+
 export interface PrincipalPropagationYaml {
   enabled?: boolean;
   jwt_secret_env?: string;
@@ -80,6 +104,8 @@ export interface PrincipalPropagationYaml {
 export interface PolicyConfig {
   version: number;
   approvals?: ApprovalsYaml;
+  network?: NetworkYaml;
+  audit?: AuditYaml;
   principal_propagation?: PrincipalPropagationYaml;
   defaults: {
     max_rows: number;

@@ -32,6 +32,8 @@ export interface PreflightResult {
 export interface PreflightOptions {
   /** Expected tier: reader requires default_transaction_read_only=on. */
   tier: AgentTier;
+  /** Phase 5: require this session to be TLS (pg_stat_ssl), e.g. when sslmode=verify-full. */
+  requireSsl?: boolean;
   /** Optional injectable client factory (tests). */
   connect?: () => Promise<{
     query: pg.PoolClient["query"];
@@ -166,6 +168,18 @@ export async function runPreflight(
           ? "dblink/postgres_fdw not installed"
           : `forbidden extensions present: ${found.join(", ")}`,
     });
+
+    if (opts.requireSsl) {
+      const ssl = await client.query<{ ssl: boolean; version: string | null }>(
+        "SELECT ssl, version FROM pg_stat_ssl WHERE pid = pg_backend_pid()",
+      );
+      const r = ssl.rows[0];
+      checks.push({
+        name: "ssl_in_use",
+        ok: Boolean(r?.ssl),
+        detail: r?.ssl ? `TLS ${r.version ?? ""}`.trim() : "session is not encrypted (pg_stat_ssl.ssl = false)",
+      });
+    }
 
     const ok = checks.every((c) => c.ok);
     const firstFail = checks.find((c) => !c.ok);

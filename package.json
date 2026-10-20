@@ -13,7 +13,8 @@
     "dev": "tsx src/index.ts",
     "test": "node --experimental-vm-modules node_modules/jest/bin/jest.js --coverage=false --runInBand",
     "policy:check": "tsx src/policy/check.ts",
-    "approvals": "tsx src/approvals/cli.ts"
+    "approvals": "tsx src/approvals/cli.ts",
+    "audit:verify": "tsx src/audit/verify-cli.ts"
   },
   "keywords": [
     "postgres",

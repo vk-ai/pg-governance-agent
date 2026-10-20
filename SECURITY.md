@@ -43,7 +43,7 @@ Postgres grants in `docker/postgres/init/01-schema.sql` mirror this.
 
 - Byte caps limit what the agent receives. A single large cell still crosses the wire in full before it is cut, bounded by `statement_timeout` and Postgres's 1 GB field limit. Plans that sort, hash or aggregate do their full work before the first row.
 - The guard does not cover: string-to-OID casts (`'hr.t'::regclass`, `to_regclass`) and catalog-metadata functions that reveal whether an object exists; temp tables (`pg_temp` is searched before the path). DB grants cover both.
-- Still pending: DB host allowlist, tamper-evident audit and CI against Postgres (phase 5).
+- The DB host allowlist, tamper-evident audit and CI against Postgres were added in phase 5 (below).
 
 ### Out-of-band approvals (phase 4)
 
@@ -52,11 +52,20 @@ Postgres grants in `docker/postgres/init/01-schema.sql` mirror this.
 - Fail closed: approvals required + no public key → real runs refused.
 - Limits: `approver` is self-declared by the key holder (no per-approver keys or revocation yet); the file ledger is per host (use `ledger: postgres` with more than one server); DDL and the file ledger spend the approval before the statement runs, so a failed statement needs a new approval.
 
+### Network allowlist and TLS (phase 5)
+
+- `network.allowed_db_hosts` (names, `*.suffix`, IPs, CIDRs) is checked before every connection; a host that isn't listed is refused before DNS lookup. The resolved addresses are checked against `allowed_db_cidrs` when set, and link-local and unspecified addresses (cloud metadata) are always refused.
+- PgGuard connects to the address it checked (DNS pinning) and verifies the certificate against the original hostname.
+- Non-loopback hosts must use `sslmode=verify-full`. `plaintext_loopback_ok` (on in the shipped demo policy) allows `disable` only when every address is loopback.
+- With `verify-full`, preflight refuses to start if `pg_stat_ssl` shows the session is not encrypted.
+- Limits: this is an in-process check, so a compromised process can skip it. Enforce egress in the network (`deploy/networkpolicy.yaml`, security groups) and with `hostssl`-only `pg_hba.conf` entries for agent roles. Without `allowed_db_cidrs`, a listed name that resolves somewhere unexpected is still accepted (except link-local and unspecified addresses).
+
 ## TLS notes
 
-- Set `PGSSLMODE` / Vault `sslmode` to `require` or `verify-full` in non-local environments.
-- Pool config enables TLS when `sslmode !== disable` (`src/db/pool.ts`).
-- Local Compose uses `disable` for simplicity on localhost.
+- Use `PGSSLMODE` / Vault `sslmode` = `verify-full` with `PGSSLROOTCERT` / Vault `sslrootcert` for anything that isn't loopback. The phase 5 network policy refuses anything weaker.
+- `sslrootcert` replaces the default trust store (as in libpq). Without it, Node's default store is used, which on some Linux builds includes `/etc/ssl/certs`.
+- `verify-ca` checks the chain but not the hostname, so the network policy does not accept it.
+- Local Compose uses `disable` on localhost (allowed by `plaintext_loopback_ok`).
 
 ## SQL injection defenses
 
@@ -99,7 +108,10 @@ CREATE POLICY tenant_isolation ON orders
 ## Audit
 
 - Append-only JSONL: `data/audit/events.jsonl` (gitignored).
-- Each tool invocation logs role, tool name, success/failure, SQL preview (truncated), timestamps.
+- Each tool invocation logs role, tool name, success/failure, SQL preview (truncated), `sql_sha256` of the full SQL, timestamps, and approval ids for approved writes.
+- **Hash chain (phase 5):** every line has `seq`, `prev`, `alg` and `hash`. Set `PGGUARD_AUDIT_HMAC_KEY` (hex, 32 bytes or more) to make it an HMAC chain. The server refuses to start if the log does not verify. `npm run audit:verify [--expect-head seq:hash]` finds the first bad line.
+- Limits: without the HMAC key (or with the key readable on the same host), a writer can rebuild the chain. A cut-off tail is only caught against a head recorded elsewhere. Use one writer per file, and treat lines from before phase 5 as unprotected (`legacy`).
+- `reader` no longer has `audit_read` by default.
 - Structured operational logs → **stderr** as JSON lines (stdout reserved for MCP).
 
 ## Production checklist
@@ -110,6 +122,7 @@ CREATE POLICY tenant_isolation ON orders
 - [ ] Set `allowed_schemas` per role to match the schemas you GRANT (USAGE/SELECT); grant nothing else
 - [ ] Tune `max_rows` / `max_result_bytes` / `max_cell_bytes` to what an agent should ever see in one call
 - [ ] Do not install `dblink` / `postgres_fdw` / untrusted PLs on agent databases (preflight refuses them)
-- [ ] Ship audit to immutable / SIEM store
+- [ ] Ship audit to immutable / SIEM store; set `PGGUARD_AUDIT_HMAC_KEY` and record `audit:verify` heads off-host
+- [ ] `network.allowed_db_hosts` lists only your DB hosts, `allowed_db_cidrs` is set, `plaintext_loopback_ok: false`, `sslmode=verify-full` + `sslrootcert`
 - [ ] Restrict who can set `PGGUARD_ROLE=admin|migrator`
-- [ ] Network isolation: agent host → DB/Vault only
+- [ ] Network isolation: agent host → DB/Vault only (`deploy/networkpolicy.yaml`), `hostssl` rules in `pg_hba.conf`
