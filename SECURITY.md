@@ -43,7 +43,14 @@ Postgres grants in `docker/postgres/init/01-schema.sql` mirror this.
 
 - Byte caps limit what the agent receives. A single large cell still crosses the wire in full before it is cut, bounded by `statement_timeout` and Postgres's 1 GB field limit. Plans that sort, hash or aggregate do their full work before the first row.
 - The guard does not cover: string-to-OID casts (`'hr.t'::regclass`, `to_regclass`) and catalog-metadata functions that reveal whether an object exists; temp tables (`pg_temp` is searched before the path). DB grants cover both.
-- Still pending: real out-of-band approvals (phase 4); DB host allowlist, tamper-evident audit and CI against Postgres (phase 5).
+- Still pending: DB host allowlist, tamper-evident audit and CI against Postgres (phase 5).
+
+### Out-of-band approvals (phase 4)
+
+- Real `run_dml` / `run_ddl` calls need an Ed25519-signed token from `npm run approvals -- approve`. The server holds only the public key and refuses to start if `PGGUARD_APPROVAL_PRIVATE_KEY*` is in its environment.
+- Tokens are bound to the exact SQL text (sha256), tool, role, DB user, database and JWT `sub`; they expire (`max_ttl_seconds`, no grace) and are single use (`jti` in a file ledger or `pgguard.approval_ledger`).
+- Fail closed: approvals required + no public key → real runs refused.
+- Limits: `approver` is self-declared by the key holder (no per-approver keys or revocation yet); the file ledger is per host (use `ledger: postgres` with more than one server); DDL and the file ledger spend the approval before the statement runs, so a failed statement needs a new approval.
 
 ## TLS notes
 

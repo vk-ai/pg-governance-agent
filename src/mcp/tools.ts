@@ -1,6 +1,8 @@
 import { z } from "zod";
 import type { AppContext } from "./context.js";
-import { credsForPolicy } from "./context.js";
+import { approvalRuntime, credsForPolicy } from "./context.js";
+import { approvalRequired, checkApproval, effectiveAffectedCap, privateKeyInServerEnv } from "../approvals/gate.js";
+import { ApprovalError, sqlSha256, type ApprovalClaims, type ApprovalScope, type ApprovalTool } from "../approvals/token.js";
 import {
   AffectedRowsCapExceeded,
   withClient,
@@ -49,6 +51,17 @@ function errResult(message: string) {
   };
 }
 
+const approvalProps = {
+  approval_id: {
+    type: "string" as const,
+    description: "Phase 4: id returned by request_approval; the server loads the human-signed token once it is approved.",
+  },
+  approval_token: {
+    type: "string" as const,
+    description: "Phase 4: signed approval token (pga1....) minted out of band by `npm run approvals -- approve`.",
+  },
+};
+
 const bearerTokenProp = {
   bearer_token: {
     type: "string" as const,
@@ -94,6 +107,28 @@ function schemaArgDenied(ctx: AppContext, schema: string): string | null {
   return isSchemaAllowed(schema, ctx.policy.allowedSchemas)
     ? null
     : `Schema '${schema}' is not allowed for this role (allowed_schemas: ${(ctx.policy.allowedSchemas || []).join(", ") || "(none)"})`;
+}
+
+/** Scope a token must match, built from the live call (never from the token). */
+function approvalScope(
+  ctx: AppContext,
+  tool: ApprovalTool,
+  sql: string,
+  database: string,
+  principalSub: string | undefined,
+): ApprovalScope {
+  return {
+    tool,
+    role: ctx.policy.roleName,
+    db_user: ctx.policy.role.db_user,
+    database,
+    sub: principalSub ?? null,
+    sql_sha256: sqlSha256(sql),
+  };
+}
+
+function approvalAudit(c: ApprovalClaims) {
+  return { approval: { jti: c.jti, rid: c.rid, approver: c.approver, exp: c.exp, max_affected_rows: c.max_affected_rows } };
 }
 
 function capsMeta(r: CappedResult, caps: { maxRows: number; maxResultBytes: number; maxCellBytes: number }) {
@@ -178,6 +213,7 @@ export const toolDefs = [
         sql: { type: "string" },
         confirm: { type: "boolean" },
         dry_run: { type: "boolean", description: "Preview: execute, report rowCount (and RETURNING sample), then ROLLBACK" },
+        ...approvalProps,
         ...bearerTokenProp,
       },
       required: ["sql"],
@@ -186,16 +222,33 @@ export const toolDefs = [
   },
   {
     name: "run_ddl",
-    description: "CREATE/ALTER/DROP for migrator/admin; requires confirm:true; optional dry_run",
+    description: "CREATE/ALTER/DROP for migrator/admin; requires confirm:true (and an out-of-band approval when policy requires it); optional dry_run",
     inputSchema: {
       type: "object" as const,
       properties: {
         sql: { type: "string" },
         confirm: { type: "boolean" },
         dry_run: { type: "boolean" },
+        ...approvalProps,
         ...bearerTokenProp,
       },
       required: ["sql"],
+      additionalProperties: false,
+    },
+  },
+  {
+    name: "request_approval",
+    description:
+      "Phase 4: ask a human to approve one exact DML/DDL statement. Returns approval_id and the SQL sha256; a human approves out of band with `npm run approvals -- approve <approval_id>` (the server cannot). DML requests include a rolled-back dry-run row count for the approver.",
+    inputSchema: {
+      type: "object" as const,
+      properties: {
+        tool: { type: "string", enum: ["run_dml", "run_ddl"] },
+        sql: { type: "string", description: "Exact SQL to run later; any byte change needs a new approval" },
+        reason: { type: "string", description: "Why the change is needed (shown to the approver)" },
+        ...bearerTokenProp,
+      },
+      required: ["tool", "sql"],
       additionalProperties: false,
     },
   },
@@ -375,7 +428,21 @@ export async function handleTool(
         }
         const { readOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
-        const maxAffectedRows = ctx.policy.maxAffectedRows;
+        // Phase 4: real runs need a human-signed, single-use, SQL-bound approval.
+        let claims: ApprovalClaims | null = null;
+        const rt = approvalRuntime(ctx);
+        if (!dryRun && approvalRequired(rt.policy, "dml")) {
+          try {
+            claims = checkApproval(rt, args, approvalScope(ctx, "run_dml", sql, creds.database, principalSub));
+            if (rt.ledger.kind === "file") await rt.ledger.consume(claims);
+          } catch (e) {
+            if (!(e instanceof ApprovalError)) throw e;
+            ctx.audit.append({ tool: name, role, principal: principalSub, ok: false, error: e.message, sqlPreview: sql, detail: { approval_error: e.code } });
+            return errResult(e.message);
+          }
+        }
+        const maxAffectedRows = effectiveAffectedCap(ctx.policy.maxAffectedRows, claims);
+        const pgConsume = claims && rt.ledger.kind === "postgres" ? claims : null;
         try {
           const r = await withDmlTransaction(creds, sql, {
             sessionGucs: readOpts.sessionGucs,
@@ -383,6 +450,7 @@ export async function handleTool(
             searchPath: readOpts.searchPath,
             maxAffectedRows,
             dryRun,
+            ...(pgConsume ? { beforeStatement: (c: import("pg").PoolClient) => rt.ledger.consume(pgConsume, c) } : {}),
           });
           const out = {
             ok: true,
@@ -407,9 +475,10 @@ export async function handleTool(
               dry_run: r.dryRun,
               committed: r.committed,
               max_affected_rows: maxAffectedRows,
+              ...(claims ? approvalAudit(claims) : {}),
             },
           });
-          return textResult(out);
+          return textResult(claims ? { ...out, approval: { rid: claims.rid, approver: claims.approver, consumed: r.committed } } : out);
         } catch (e) {
           if (e instanceof AffectedRowsCapExceeded) {
             ctx.audit.append({
@@ -421,6 +490,10 @@ export async function handleTool(
               sqlPreview: sql,
               detail: { rowCount: e.rowCount, max_affected_rows: e.maxAffectedRows, committed: false },
             });
+            return errResult(e.message);
+          }
+          if (e instanceof ApprovalError) {
+            ctx.audit.append({ tool: name, role, principal: principalSub, ok: false, error: e.message, sqlPreview: sql, detail: { approval_error: e.code } });
             return errResult(e.message);
           }
           throw e;
@@ -467,6 +540,23 @@ export async function handleTool(
         }
         const { withOpts, principalSub } = sessionOpts(ctx, args);
         const creds = await credsForPolicy(ctx);
+        let ddlClaims: ApprovalClaims | null = null;
+        const ddlRt = approvalRuntime(ctx);
+        if (approvalRequired(ddlRt.policy, "ddl")) {
+          try {
+            ddlClaims = checkApproval(ddlRt, args, approvalScope(ctx, "run_ddl", sql, creds.database, principalSub));
+            // DDL may run in autocommit (CREATE INDEX CONCURRENTLY), so the approval is spent first.
+            if (ddlRt.ledger.kind === "file") await ddlRt.ledger.consume(ddlClaims);
+            else {
+              const c0 = ddlClaims;
+              await withClient(creds, (c) => ddlRt.ledger.consume(c0, c), { timeouts: ctx.policy.readTxn });
+            }
+          } catch (e) {
+            if (!(e instanceof ApprovalError)) throw e;
+            ctx.audit.append({ tool: name, role, principal: principalSub, ok: false, error: e.message, sqlPreview: sql, detail: { approval_error: e.code } });
+            return errResult(e.message);
+          }
+        }
         const result = await withClient(
           creds,
           async (c) => {
@@ -481,9 +571,66 @@ export async function handleTool(
           principal: principalSub,
           ok: true,
           sqlPreview: sql,
-          detail: { ...result, class: cls.statementClass },
+          detail: { ...result, class: cls.statementClass, ...(ddlClaims ? approvalAudit(ddlClaims) : {}) },
         });
-        return textResult({ ok: true, ...result, class: cls.statementClass });
+        return textResult({
+          ok: true,
+          ...result,
+          class: cls.statementClass,
+          ...(ddlClaims ? { approval: { rid: ddlClaims.rid, approver: ddlClaims.approver, consumed: true } } : {}),
+        });
+      }
+      case "request_approval": {
+        const tool = z.enum(["run_dml", "run_ddl"]).parse(args.tool);
+        const sql = z.string().min(1).parse(args.sql);
+        const reason = args.reason === undefined ? undefined : z.string().max(2000).parse(args.reason);
+        assertCapability(ctx.policy, tool === "run_dml" ? "dml" : "ddl");
+        const cls = classifySql(sql, ctx.policy.config.dangerous_functions);
+        const kindOk = tool === "run_dml" ? isDml(cls.statementClass) : isDdl(cls.statementClass);
+        if (!cls.ok || !kindOk) {
+          const msg = cls.reason || `Expected ${tool === "run_dml" ? "DML" : "DDL"}, got ${cls.statementClass}`;
+          ctx.audit.append({ tool: name, role, ok: false, error: msg, sqlPreview: sql });
+          return errResult(msg);
+        }
+        const reqDenied = schemaDenied(ctx, sql);
+        if (reqDenied) {
+          ctx.audit.append({ tool: name, role, ok: false, error: reqDenied, sqlPreview: sql });
+          return errResult(reqDenied);
+        }
+        const { readOpts, principalSub } = sessionOpts(ctx, args);
+        const creds = await credsForPolicy(ctx);
+        let preview: { rowCount: number; would_exceed_cap: boolean; max_affected_rows: number } | undefined;
+        if (tool === "run_dml") {
+          const r = await withDmlTransaction(creds, sql, {
+            sessionGucs: readOpts.sessionGucs,
+            timeouts: ctx.policy.readTxn,
+            searchPath: readOpts.searchPath,
+            maxAffectedRows: ctx.policy.maxAffectedRows,
+            dryRun: true,
+          });
+          preview = { rowCount: r.rowCount, would_exceed_cap: r.capExceeded, max_affected_rows: ctx.policy.maxAffectedRows };
+        }
+        const rt = approvalRuntime(ctx);
+        const scope = approvalScope(ctx, tool, sql, creds.database, principalSub);
+        const req = rt.queue.create({ ...scope, sql, reason, preview });
+        ctx.audit.append({
+          tool: name,
+          role,
+          principal: principalSub,
+          ok: true,
+          sqlPreview: sql,
+          detail: { rid: req.rid, sql_sha256: req.sql_sha256, for_tool: tool, preview },
+        });
+        return textResult({
+          ok: true,
+          approval_id: req.rid,
+          status: "pending",
+          sql_sha256: req.sql_sha256,
+          for_tool: tool,
+          ...(preview ? { preview } : {}),
+          approvals_required: approvalRequired(rt.policy, tool === "run_dml" ? "dml" : "ddl"),
+          next: `A human runs: npm run approvals -- approve ${req.rid} --approver <name>. Then call ${tool} with the same sql, confirm: true and approval_id: "${req.rid}".`,
+        });
       }
       case "explain_query": {
         assertCapability(ctx.policy, "explain");
@@ -562,6 +709,13 @@ export async function handleTool(
           require_confirm_ddl: p.requireConfirmDdl,
           allow_explain_analyze: p.allowExplainAnalyze,
           dual_control_ddl: p.dualControlDdl,
+          approvals: {
+            required_for: p.approvals.requiredFor,
+            public_key_configured: Boolean(approvalRuntime(ctx).publicKey),
+            ledger: p.approvals.ledger,
+            max_ttl_seconds: p.approvals.maxTtlSeconds,
+            private_key_env_in_server: privateKeyInServerEnv(),
+          },
           allowed_schemas: p.allowedSchemas,
           search_path: p.searchPath,
           max_result_bytes: p.maxResultBytes,

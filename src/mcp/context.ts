@@ -6,6 +6,7 @@ import {
   type EffectivePolicy,
 } from "../policy/index.js";
 import type { PreflightResult } from "../db/preflight.js";
+import { createApprovalRuntime, type ApprovalRuntime } from "../approvals/gate.js";
 
 export interface AppContext {
   secrets: SecretsProvider;
@@ -13,6 +14,13 @@ export interface AppContext {
   policy: EffectivePolicy;
   /** Result of startup DB preflight (role hardens, timeouts, no FDW). */
   preflight?: PreflightResult;
+  /** Phase 4 approval gate (public key, ledger, request queue). Built lazily from policy.approvals. */
+  approvals?: ApprovalRuntime;
+}
+
+export function approvalRuntime(ctx: AppContext): ApprovalRuntime {
+  if (!ctx.approvals) ctx.approvals = createApprovalRuntime(ctx.policy.approvals);
+  return ctx.approvals;
 }
 
 export function createAppContext(): AppContext {

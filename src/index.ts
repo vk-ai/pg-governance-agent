@@ -9,7 +9,8 @@ import {
   CallToolRequestSchema,
   ListToolsRequestSchema,
 } from "@modelcontextprotocol/sdk/types.js";
-import { createAppContext, credsForPolicy } from "./mcp/context.js";
+import { approvalRuntime, createAppContext, credsForPolicy } from "./mcp/context.js";
+import { privateKeyInServerEnv } from "./approvals/gate.js";
 import { handleTool, toolDefs } from "./mcp/tools.js";
 import { closePool } from "./db/pool.js";
 import { assertPreflight, tierFromAllow } from "./db/preflight.js";
@@ -21,6 +22,20 @@ async function main(): Promise<void> {
     role: ctx.policy.roleName,
     db_user: ctx.policy.role.db_user,
   });
+
+  // Phase 4 separation of duties: the approver's signing key must never be in the
+  // server's environment (anything driving the tools could then mint approvals).
+  const leaked = privateKeyInServerEnv();
+  if (leaked.length) {
+    throw new Error(`Refusing to start: approver private key env present in server env (${leaked.join(", ")})`);
+  }
+  const approvals = approvalRuntime(ctx);
+  if (approvals.policy.requiredFor.length && !approvals.publicKey) {
+    log("warn", "approvals_not_configured", {
+      required_for: approvals.policy.requiredFor,
+      note: `no ${approvals.policy.publicKeyEnv}; real ${approvals.policy.requiredFor.join("/")} runs will be refused`,
+    });
+  }
 
   // Fail closed: refuse to start if the DB role is superuser/BYPASSRLS, missing
   // statement_timeout, wrong default_transaction_read_only for the tier, or if

@@ -296,6 +296,12 @@ export interface DmlTxnOptions {
   sampleRows?: number;
   /** SET LOCAL search_path (schema guard). */
   searchPath?: readonly string[] | null;
+  /**
+   * Runs in the same transaction just before the statement (phase 4: consume the
+   * approval in the Postgres ledger, so it is spent only if the write commits).
+   * Not called for dry runs.
+   */
+  beforeStatement?: (client: pg.PoolClient) => Promise<void>;
 }
 
 export interface DmlTxnResult {
@@ -351,6 +357,7 @@ export async function dmlTransactionOn(
       if (opts.sessionGucs && Object.keys(opts.sessionGucs).length > 0) {
         await applySessionGucs(client, opts.sessionGucs);
       }
+      if (opts.beforeStatement && !opts.dryRun) await opts.beforeStatement(client);
       const r = await client.query({ text: sql, queryMode: "extended" } as pg.QueryConfig);
       const rowCount = r.rowCount ?? 0;
       const cap = opts.maxAffectedRows;

@@ -18,7 +18,7 @@ Corporate expectation: no single actor applies production DDL silently.
 - Policy marks migrator/admin with `dual_control_ddl: true`.
 - MCP tool refuses DDL without `confirm: true`.
 - Audit trail records who (role), what (SQL preview), when.
-- Recommended process: PR / change ticket → dry_run → human approval → confirm execute.
+- Recommended process: PR / change ticket → `request_approval` (includes dry_run count) → human runs `npm run approvals -- approve <id>` → agent runs with `confirm: true` + `approval_id`. The approval is single use, expires, and only matches the exact SQL that was reviewed (phase 4).
 
 ## RBAC roles
 
