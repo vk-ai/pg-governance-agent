@@ -6,6 +6,7 @@ interface VaultKvData {
   port?: string | number;
   database?: string;
   sslmode?: string;
+  sslrootcert?: string;
   user?: string;
   password?: string;
   reader_user?: string;
@@ -85,6 +86,7 @@ export class VaultSecretsProvider implements SecretsProvider {
       user,
       password,
       sslmode: data.sslmode || "disable",
+      sslrootcert: data.sslrootcert || process.env.PGSSLROOTCERT || undefined,
     };
   }
 }

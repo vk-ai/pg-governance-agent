@@ -1,3 +1,4 @@
+import fs from "node:fs";
 import pg from "pg";
 import type { DbCredentials } from "../secrets/types.js";
 import { log } from "../utils/logger.js";
@@ -6,27 +7,53 @@ import { searchPathValue } from "../policy/schemaGuard.js";
 const { Pool } = pg;
 
 let pool: pg.Pool | null = null;
-let currentUser: string | null = null;
+let currentKey: string | null = null;
+
+/** Extra TLS inputs for {@link sslConfigFor}. */
+export interface TlsInputs {
+  /** PEM CA bundle text (from sslrootcert). Replaces the system store, like libpq. */
+  ca?: string;
+  /** Hostname to verify (and send as SNI) when the socket targets a pinned IP. */
+  servername?: string;
+}
 
 /**
  * libpq sslmode → node-pg TLS options.
  * verify-ca / verify-full: certificate chain must validate (rejectUnauthorized).
  * verify-ca skips only the hostname check, matching libpq. require/prefer/allow
  * encrypt without verifying, as in libpq. Unknown modes are refused.
+ * With a pinned IP, verify-full checks the certificate against `servername`.
  */
-export function sslConfigFor(sslmode: string | undefined): pg.PoolConfig["ssl"] {
+export function sslConfigFor(sslmode: string | undefined, tls: TlsInputs = {}): pg.PoolConfig["ssl"] {
   const mode = (sslmode || "").trim().toLowerCase();
   if (!mode || mode === "disable") return undefined;
-  if (mode === "verify-full") return { rejectUnauthorized: true };
+  const extra: Record<string, unknown> = {};
+  if (tls.ca) extra.ca = tls.ca;
+  if (tls.servername) extra.servername = tls.servername;
+  if (mode === "verify-full") return { rejectUnauthorized: true, ...extra };
   if (mode === "verify-ca") {
-    return { rejectUnauthorized: true, checkServerIdentity: () => undefined };
+    return { rejectUnauthorized: true, ...extra, checkServerIdentity: () => undefined };
   }
   if (mode === "require" || mode === "prefer" || mode === "allow") return { rejectUnauthorized: false };
   throw new Error(`Unsupported sslmode: ${sslmode}`);
 }
 
+function readCa(path: string | undefined): string | undefined {
+  if (!path) return undefined;
+  try {
+    return fs.readFileSync(path, "utf8");
+  } catch (e) {
+    throw new Error(`Cannot read sslrootcert ${path}: ${e instanceof Error ? e.message : String(e)}`);
+  }
+}
+
 export function buildConnectionConfig(creds: DbCredentials): pg.PoolConfig {
-  const ssl = sslConfigFor(creds.sslmode);
+  const mode = (creds.sslmode || "").trim().toLowerCase();
+  const verifying = mode === "verify-full" || mode === "verify-ca";
+  const ssl = sslConfigFor(creds.sslmode, {
+    ca: verifying ? readCa(creds.sslrootcert) : undefined,
+    servername: creds.tlsServername,
+  });
   return {
     host: creds.host,
     port: creds.port,
@@ -40,14 +67,19 @@ export function buildConnectionConfig(creds: DbCredentials): pg.PoolConfig {
   };
 }
 
+function poolKey(c: DbCredentials): string {
+  return JSON.stringify([c.user, c.host, c.port, c.database, c.sslmode ?? "", c.sslrootcert ?? "", c.tlsServername ?? ""]);
+}
+
 export async function getPool(creds: DbCredentials): Promise<pg.Pool> {
-  if (pool && currentUser === creds.user) return pool;
+  const key = poolKey(creds);
+  if (pool && currentKey === key) return pool;
   if (pool) {
     await pool.end().catch(() => undefined);
     pool = null;
   }
   pool = new Pool(buildConnectionConfig(creds));
-  currentUser = creds.user;
+  currentKey = key;
   pool.on("error", (err) => log("error", "pg_pool_error", { error: err.message }));
   return pool;
 }
@@ -56,7 +88,7 @@ export async function closePool(): Promise<void> {
   if (pool) {
     await pool.end().catch(() => undefined);
     pool = null;
-    currentUser = null;
+    currentKey = null;
   }
 }
 

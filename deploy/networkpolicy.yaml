@@ -1,0 +1,56 @@
+# Example Kubernetes NetworkPolicy for the PgGuard MCP server (phase 5).
+#
+# The policy.yaml `network:` allowlist is an application-level check. This is
+# the control that holds even if the process is compromised: the PgGuard pod
+# may reach only the database (and DNS / Vault if used), nothing else.
+# Adjust namespaces, labels, CIDRs and ports to your cluster. Requires a CNI
+# that enforces NetworkPolicy (Calico, Cilium, ...).
+apiVersion: networking.k8s.io/v1
+kind: NetworkPolicy
+metadata:
+  name: pgguard-egress
+  namespace: ai-agents
+spec:
+  podSelector:
+    matchLabels:
+      app: pgguard
+  policyTypes: [Ingress, Egress]
+  ingress: []            # stdio MCP: nothing should connect in
+  egress:
+    # Postgres: the managed instance's private range only.
+    - to:
+        - ipBlock:
+            cidr: 10.20.0.0/16
+      ports:
+        - protocol: TCP
+          port: 5432
+    # Vault (only if PGGUARD_SECRETS_PROVIDER=vault).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: vault
+      ports:
+        - protocol: TCP
+          port: 8200
+    # Cluster DNS (PgGuard resolves the DB host itself, then pins the address).
+    - to:
+        - namespaceSelector:
+            matchLabels:
+              kubernetes.io/metadata.name: kube-system
+          podSelector:
+            matchLabels:
+              k8s-app: kube-dns
+      ports:
+        - protocol: UDP
+          port: 53
+        - protocol: TCP
+          port: 53
+# Not covered here (do these too):
+# - Cloud metadata (169.254.169.254) is outside the allowed ranges, so it is blocked;
+#   PgGuard also refuses link-local addresses itself.
+# - DB side: pg_hba.conf should accept the agent roles only with `hostssl` from the
+#   PgGuard subnet, e.g.
+#     hostssl corpdb app_reader,app_writer 10.30.4.0/24 scram-sha-256
+#     host    all    app_reader,app_writer 0.0.0.0/0   reject
+# - No dblink / postgres_fdw in the database (PgGuard's preflight refuses to start if
+#   they are installed), so the DB cannot be used as a hop to other hosts.

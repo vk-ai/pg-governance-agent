@@ -1,0 +1,55 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+permissions:
+  contents: read
+
+jobs:
+  test-pg17:
+    name: typecheck + tests (Postgres 17, TLS on)
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 20
+          cache: npm
+
+      # docker run instead of a service container: services cannot pass `-c ssl=on`.
+      # The image ships a self-signed snakeoil cert; the TLS tests trust it via
+      # PGGUARD_IT_TLS_CA and map its name to 127.0.0.1 with an injected resolver.
+      - name: Start Postgres 17 with TLS
+        run: |
+          docker run -d --name pg17 -p 5432:5432 \
+            -e POSTGRES_PASSWORD=postgres_dev_only \
+            postgres:17 \
+            -c ssl=on \
+            -c ssl_cert_file=/etc/ssl/certs/ssl-cert-snakeoil.pem \
+            -c ssl_key_file=/etc/ssl/private/ssl-cert-snakeoil.key
+          for i in $(seq 1 60); do
+            if docker exec pg17 pg_isready -U postgres -h 127.0.0.1 >/dev/null 2>&1; then break; fi
+            sleep 1
+          done
+          docker exec pg17 psql -U postgres -h 127.0.0.1 -Atc "SELECT version(); SHOW ssl"
+          docker cp pg17:/etc/ssl/certs/ssl-cert-snakeoil.pem "$RUNNER_TEMP/pg-ca.pem"
+
+      - run: npm ci
+      - run: npx tsc --noEmit
+      - run: npm run policy:check
+
+      - name: Tests (offline + live PG17)
+        run: npm test
+        env:
+          PGGUARD_IT_DATABASE_URL: postgres://postgres:postgres_dev_only@localhost:5432/postgres
+          PGGUARD_IT_TLS_CA: ${{ runner.temp }}/pg-ca.pem
+          PGGUARD_IT_REQUIRE_TLS: "1"
+
+      - name: Postgres logs on failure
+        if: failure()
+        run: docker logs pg17 | tail -200

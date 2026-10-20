@@ -9,6 +9,7 @@ import {
 import type { ReadTxnOptions } from "../db/pool.js";
 import { log } from "../utils/logger.js";
 import { SCHEMA_IDENT_RE } from "./schemaGuard.js";
+import { NETWORK_OFF, hostEntryError, type NetworkPolicy } from "../net/allowlist.js";
 
 /** Defaults used when policy.yaml does not set read-transaction timeouts. */
 export const DEFAULT_READ_TXN: Required<ReadTxnOptions> = {
@@ -59,6 +60,62 @@ export function resolveApprovalPolicy(config: PolicyConfig, role: RolePolicy, ro
   };
 }
 
+/**
+ * Resolve the phase 5 `network:` block. No block = not enforced (whoami reports
+ * it); a block with an empty allowed_db_hosts is an error, not "allow all".
+ */
+export function resolveNetworkPolicy(config: PolicyConfig): NetworkPolicy {
+  const n = config.network;
+  if (n === undefined || n === null) return { ...NETWORK_OFF };
+  if (typeof n !== "object") throw new Error("network must be a mapping");
+  const hosts = n.allowed_db_hosts;
+  if (!Array.isArray(hosts) || hosts.length === 0) {
+    throw new Error("network.allowed_db_hosts must be a non-empty list (remove the network block to disable the allowlist)");
+  }
+  for (const h of hosts) {
+    const err = hostEntryError(h);
+    if (err) throw new Error(`network.allowed_db_hosts: ${err}`);
+  }
+  const cidrs = n.allowed_db_cidrs ?? [];
+  if (!Array.isArray(cidrs)) throw new Error("network.allowed_db_cidrs must be a list");
+  for (const c of cidrs) {
+    if (typeof c !== "string" || !c.includes("/") || hostEntryError(c)) {
+      throw new Error(`network.allowed_db_cidrs: invalid CIDR '${String(c)}'`);
+    }
+  }
+  const req = n.require_sslmode ?? "verify-full";
+  if (req !== "verify-full") throw new Error(`network.require_sslmode must be verify-full, got ${String(req)}`);
+  for (const k of ["plaintext_loopback_ok", "pin_resolved_ip"] as const) {
+    if (n[k] !== undefined && typeof n[k] !== "boolean") throw new Error(`network.${k} must be true or false`);
+  }
+  return {
+    enforced: true,
+    allowedDbHosts: hosts.map((h) => String(h).trim()),
+    allowedDbCidrs: cidrs.map((c) => String(c).trim()),
+    requireSslmode: "verify-full",
+    plaintextLoopbackOk: n.plaintext_loopback_ok ?? false,
+    pinResolvedIp: n.pin_resolved_ip ?? true,
+  };
+}
+
+/** Resolved phase 5 audit settings. */
+export interface AuditPolicy {
+  hashChain: boolean;
+  hmacKeyEnv: string;
+  verifyOnStart: boolean;
+}
+
+export function resolveAuditPolicy(config: PolicyConfig): AuditPolicy {
+  const a = config.audit ?? {};
+  if (typeof a !== "object") throw new Error("audit must be a mapping");
+  for (const k of ["hash_chain", "verify_on_start"] as const) {
+    if (a[k] !== undefined && typeof a[k] !== "boolean") throw new Error(`audit.${k} must be true or false`);
+  }
+  const env = a.hmac_key_env ?? "PGGUARD_AUDIT_HMAC_KEY";
+  if (!/^[A-Z_][A-Z0-9_]*$/.test(env)) throw new Error(`audit.hmac_key_env is not an env var name: ${env}`);
+  return { hashChain: a.hash_chain ?? true, hmacKeyEnv: env, verifyOnStart: a.verify_on_start ?? true };
+}
+
 export type AgentRoleName = "reader" | "writer" | "migrator" | "admin" | string;
 
 export interface EffectivePolicy {
@@ -84,6 +141,10 @@ export interface EffectivePolicy {
   maxCellBytes: number;
   /** Phase 4 out-of-band approvals. */
   approvals: ApprovalPolicy;
+  /** Phase 5 DB network allowlist + TLS requirement. */
+  network: NetworkPolicy;
+  /** Phase 5 tamper-evident audit settings. */
+  audit: AuditPolicy;
 }
 
 function positiveInt(v: unknown, fallback: number): number {
@@ -180,6 +241,8 @@ export function resolveEffectivePolicy(
     maxResultBytes: positiveInt(role.max_result_bytes ?? d.max_result_bytes, DEFAULT_MAX_RESULT_BYTES),
     maxCellBytes: positiveInt(role.max_cell_bytes ?? d.max_cell_bytes, DEFAULT_MAX_CELL_BYTES),
     approvals: resolveApprovalPolicy(config, role, name),
+    network: resolveNetworkPolicy(config),
+    audit: resolveAuditPolicy(config),
   };
 }
 
@@ -233,6 +296,13 @@ export function validatePolicyFile(policyPath?: string): { ok: boolean; errors: 
           // soft warn only
           log("warn", "unknown_capability", { role: name, capability: a });
         }
+      }
+    }
+    for (const fn of [resolveNetworkPolicy, resolveAuditPolicy]) {
+      try {
+        fn(cfg);
+      } catch (e) {
+        errors.push(e instanceof Error ? e.message : String(e));
       }
     }
     if (!cfg.roles.reader) errors.push("Missing required role: reader");

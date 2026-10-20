@@ -36,7 +36,8 @@ Select with env: `PGGUARD_ROLE=reader`.
 ## Retention
 
 - Default audit retention guidance: **90 days** (`defaults.audit_retention_days` in policy).
-- Demo stores local JSONL; operators should rotate/archive externally.
+- Demo stores local JSONL, hash-chained since phase 5. Operators should rotate/archive externally, run `npm run audit:verify` before archiving, and record each file's head `{seq, hash}` somewhere the agent host can't write.
+- Only `writer` and above have `audit_read` by default; `reader` cannot read other principals' SQL through `get_audit_tail`.
 - Seed/demo data in Compose is disposable.
 
 ## Statement policy (summary)

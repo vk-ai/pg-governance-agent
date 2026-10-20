@@ -32,7 +32,7 @@ PgGuard sits between an AI assistant and your PostgreSQL database. It enforces r
 | `run_ddl` | Schema changes — requires `confirm` plus an approval when policy requires it; optional `dry_run` |
 | `request_approval` | Queue one exact DML/DDL statement for a human approver (returns `approval_id` + SQL sha256; DML includes a dry-run row count) |
 | `explain_query` | `EXPLAIN` (`ANALYZE` gated by policy) |
-| `get_audit_tail` | Recent audit events |
+| `get_audit_tail` | Recent hash-chained audit events (not granted to `reader` by default since phase 5) |
 | `whoami` | Effective role + policy (+ optional JWT principal) |
 
 **Principal propagation** — HS256 JWT, verified and required by default, (`bearer_token` / `PGGUARD_BEARER_TOKEN`) maps to Postgres session GUCs (`app.user_id`, …) for RLS. See [SECURITY.md](./SECURITY.md).
@@ -121,8 +121,12 @@ PGPORT=5432
 PGDATABASE=your_db
 PGUSER=app_reader
 PGPASSWORD=...                    # never commit .env
-PGSSLMODE=require                 # use require/verify-full in production
+PGSSLMODE=verify-full             # required for non-loopback hosts (phase 5 network policy)
+PGSSLROOTCERT=/etc/pgguard/db-ca.pem  # CA that signed the DB server certificate
 ```
+
+Add the DB host name to `network.allowed_db_hosts` in `config/policy.yaml` (see
+"Network allowlist, TLS, tamper-evident audit and CI (phase 5)" below), or PgGuard refuses to connect.
 
 **Vault instead of env passwords:** set `PGGUARD_SECRETS_PROVIDER=vault`, `VAULT_ADDR`, `VAULT_TOKEN` (or AppRole), and `VAULT_KV_PATH`. Store keys such as `host`, `port`, `database`, `user`, `password`, `sslmode` (and optional `reader_user` / `writer_user` / …) under that path. Details in [SECURITY.md](./SECURITY.md).
 
@@ -146,7 +150,7 @@ npm run mcp
 3. `list_tables` for your schema
 4. `run_select` → limited rows
 5. `run_dml` as `reader` → **denied**; as `writer` with `confirm: true` → allowed
-6. `get_audit_tail` → events under `data/audit/`
+6. `get_audit_tail` (writer and up; reader no longer has `audit_read`) → events under `data/audit/`; `npm run audit:verify` checks the chain
 
 Tune allowlists, `max_rows`, and confirm flags in [`config/policy.yaml`](./config/policy.yaml). Governance expectations: [GOVERNANCE.md](./GOVERNANCE.md).
 
@@ -178,6 +182,7 @@ Demo passwords live only in `.env.example` and Compose init scripts. **Never com
 | `npm test` | Unit tests (+ live Postgres tests when `PGGUARD_IT_DATABASE_URL` is set) |
 | `npm run policy:check` | Validate `config/policy.yaml` |
 | `npm run approvals -- <cmd>` | Approver CLI: `keygen`, `list`, `show`, `approve`, `deny` (needs the private key; run it outside the server's environment) |
+| `npm run audit:verify -- [file] [--expect-head seq:hash]` | Check the audit hash chain; prints the first bad line and the current head |
 
 ---
 
@@ -241,8 +246,8 @@ still advances sequences, runs triggers (their writes are undone; anything they 
 the database is not), and holds row locks until the rollback, so a dry run on a hot table
 can block other writers for up to `lock_timeout`/`statement_timeout`. The count is a
 snapshot; it can differ when the real write runs later. DDL is unchanged
-(`run_ddl` `dry_run` still only parses). This repo has no CI workflow; tests were run
-locally.
+(`run_ddl` `dry_run` still only parses). Since phase 5 these tests also run in CI against
+Postgres 17 (`.github/workflows/ci.yml`).
 
 ---
 
@@ -328,6 +333,85 @@ expired consume; DDL approved once; a writer's token refused for the migrator ro
 
 ---
 
+## Network allowlist, TLS, tamper-evident audit and CI (phase 5)
+
+**Network allowlist (`network:` in `config/policy.yaml`).** Before any connection
+(every tool call and the startup preflight), PgGuard:
+
+1. checks the credential host against `allowed_db_hosts`: exact names, a leading
+   `*.suffix` wildcard (one or more labels), IP literals or CIDRs. A name never matches an
+   IP entry and an IP never matches a name entry. A host that isn't listed is refused
+   before DNS is asked;
+2. resolves the name once and refuses link-local and unspecified addresses
+   (`169.254.0.0/16` including cloud metadata, `fe80::/10`, `0.0.0.0/8`, `::`) whatever the
+   policy says. With `allowed_db_cidrs` set, **every** resolved address must be inside one
+   of them;
+3. requires `sslmode=verify-full` unless `plaintext_loopback_ok: true` and every resolved
+   address is loopback (the shipped local-demo setting; turn it off anywhere shared);
+4. connects to the address it just checked (`pin_resolved_ip: true`) and sends the original
+   hostname as TLS SNI and for the certificate check, so a second DNS answer can't redirect
+   the socket after the check.
+
+`PGSSLROOTCERT` (or Vault `sslrootcert`) gives the CA bundle. Like libpq's `sslrootcert`, it
+replaces the default trust store. When `sslmode=verify-full`, preflight also checks
+`pg_stat_ssl` and refuses to start on an unencrypted session. No `network:` block means no
+allowlist, and `whoami` reports `network.enforced: false`. An empty `allowed_db_hosts` is an
+error, not "allow all".
+
+**Tamper-evident audit (`audit:`).** Each line of `data/audit/events.jsonl` now has `seq`,
+`prev`, `alg` and `hash = H(prev + "\n" + canonical JSON of the line)`. H is sha256, or
+HMAC-SHA256 when `PGGUARD_AUDIT_HMAC_KEY` (hex, 32 bytes or more) is set. Lines also carry
+`sql_sha256` of the full SQL (the preview is still cut at 500 chars), and approval ids from
+phase 4 stay in `detail`. The server refuses to start if the existing log fails
+verification (`verify_on_start: true`). `npm run audit:verify` exits 1 at the first edited,
+removed, reordered or inserted line and prints the head `{seq, hash}`. Pass a previously
+recorded head with `--expect-head seq:hash` to detect a cut-off tail. Lines written before
+phase 5 are counted as `legacy` and aren't protected. The `reader` role no longer has
+`audit_read`, because the log holds other principals' SQL.
+
+**CI.** `.github/workflows/ci.yml` runs typecheck, `policy:check` and the full suite on
+every PR and on pushes to `main`. It runs against a Postgres 17 container started with
+`ssl=on`, so the live TLS tests run too (`PGGUARD_IT_REQUIRE_TLS=1` turns a TLS skip into a
+failure).
+
+**Real vs not.** Tested against Postgres 17 on the box (TLS on, self-signed cert), with
+32 new offline tests and 9 new live tests:
+
+- offline: allowlist matching and lookalike names, a host that isn't listed never reaches
+  DNS, metadata and IPv4-mapped addresses, mixed good/bad DNS answers, sslmode rules,
+  pinning against a rebinding resolver, policy validation, audit edit/delete/reorder/
+  insert/truncate/downgrade/restart/two writers, and the CLI exit codes;
+- live:
+  - a name that exists only in the injected resolver still connects, which proves the
+    pinned IP is used;
+  - a reachable server under a name that isn't listed is refused;
+  - `verify-full` connects over TLSv1.3 with the right CA and name;
+  - the wrong name is rejected, and an unrelated CA bundle is rejected;
+  - preflight `ssl_in_use` fails on a plaintext session;
+  - an edited audit line from real tool calls is caught, and startup is refused.
+
+Limits:
+
+- **This is an application check, not egress control.** A compromised process can
+  ignore it. Real egress control is a NetworkPolicy or security group
+  ([`deploy/networkpolicy.yaml`](./deploy/networkpolicy.yaml)) plus `hostssl`-only
+  `pg_hba.conf` rules for the agent roles from the PgGuard subnet, and no `dblink` /
+  `postgres_fdw` (preflight already refuses them).
+- `allowed_db_cidrs` is optional. Without it, a listed name that later resolves somewhere
+  unexpected is still accepted, except for link-local and unspecified addresses.
+- Pinning uses the first resolved address; there is no failover across the other answers.
+- Without the HMAC key, anyone who can write the file can rebuild the whole chain. With
+  the key on the same host, so can anyone who can read the key. Truncation is only
+  detectable against a head recorded elsewhere. Ship lines and heads to an append-only
+  store (SIEM, object lock).
+- One writer per audit file. A second process continues from the file tail before each
+  append, but truly concurrent appends can fork the chain, and `audit:verify` would then
+  flag it.
+- Verification on start reads the whole file (linear in log size). Rotate logs, and keep
+  each rotated file's head.
+
+---
+
 ## Security notes (short)
 
 **Phase 1 security fixes (this is a learning project; the threat model and limits are below).**
@@ -366,7 +450,7 @@ What changed, and why:
   - 200 KB text and bytea cells are cut to 64 KiB;
   - neither `max_rows: 1e9` nor a `LIMIT` in a subquery raises the cap.
 
-Still true / not fixed yet (phase 5 remains; phase 4 approvals are described above):
+Still true / not fixed yet (phases 4 and 5 are described above):
 
 - **The schema guard is a UX layer and early deny, not the boundary.** DB grants are the boundary. Gaps the guard does not cover:
   - string-to-OID casts (`'hr.t'::regclass`, `to_regclass`) and size/metadata functions can show that an object *exists*;
@@ -377,7 +461,7 @@ Still true / not fixed yet (phase 5 remains; phase 4 approvals are described abo
 
 - The token is still a tool argument. It must be signed, but an agent holding several users' tokens can pick among them.
 - The HMAC key is static per deployment, with no expiry or session binding; an agent can read its *own* MAC. Key rotation is manual (`pgguard.set_rls_key`). Avoid `log_statement=all` / parameter logging, which would record MACs.
-- Function blocking is a denylist; a new or extension function with side effects is not caught. A non-superuser can still `SET default_transaction_read_only TO off` — **grants** and `BEGIN READ ONLY` remain the write hard-stop for readers. `confirm:true` alone is agent-supplied; phase 4 adds signed out-of-band approvals on top (see above). No DB host allowlist, tamper-evident audit or CI against Postgres (phase 5).
+- Function blocking is a denylist; a new or extension function with side effects is not caught. A non-superuser can still `SET default_transaction_read_only TO off` — **grants** and `BEGIN READ ONLY` remain the write hard-stop for readers. `confirm:true` alone is agent-supplied; phase 4 adds signed out-of-band approvals on top (see above). Phase 5 adds a DB host allowlist, a hash-chained audit log and CI against Postgres 17 (see above).
 - Old RLS policies that read `current_setting('app.user_id')` directly are still spoofable at the DB layer; move them to `pgguard.current_user_id()`.
 
 Also: use least-privilege DB roles, keep DML/DDL behind `confirm`, ship `data/audit/` off the box, and treat Compose Vault as dev-only.

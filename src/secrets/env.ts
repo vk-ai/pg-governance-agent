@@ -19,6 +19,7 @@ export class EnvSecretsProvider implements SecretsProvider {
       user,
       password,
       sslmode: process.env.PGSSLMODE || "disable",
+      sslrootcert: process.env.PGSSLROOTCERT || undefined,
     };
   }
 }

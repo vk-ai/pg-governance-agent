@@ -37,12 +37,20 @@ async function main(): Promise<void> {
     });
   }
 
+  // Phase 5: credsForPolicy has already checked the host against network.allowed_db_hosts,
+  // pinned the resolved address and enforced sslmode=verify-full for non-loopback hosts.
+  log("info", "pgguard_network", {
+    enforced: ctx.policy.network.enforced,
+    audit_chain: ctx.audit.alg,
+  });
+
   // Fail closed: refuse to start if the DB role is superuser/BYPASSRLS, missing
   // statement_timeout, wrong default_transaction_read_only for the tier, or if
   // dblink/postgres_fdw are installed. Apply scripts/provision-roles.sql first.
   const creds = await credsForPolicy(ctx);
   const preflight = await assertPreflight(creds, {
     tier: tierFromAllow(ctx.policy.role.allow),
+    requireSsl: (creds.sslmode || "").toLowerCase() === "verify-full",
   });
   ctx.preflight = preflight;
   log("info", "pgguard_preflight_ok", {
