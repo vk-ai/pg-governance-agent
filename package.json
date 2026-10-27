@@ -1,7 +1,7 @@
 {
   "name": "pg-governance-agent",
-  "version": "1.0.0",
-  "description": "PgGuard Agent \u2014 corporate Postgres governance MCP server with RBAC, Vault secrets, and audit",
+  "version": "0.1.0",
+  "description": "PgGuard Agent — corporate Postgres governance MCP server with RBAC, Vault secrets, and audit",
   "type": "module",
   "main": "dist/index.js",
   "bin": {
