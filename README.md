@@ -472,4 +472,15 @@ Full guidance: [SECURITY.md](./SECURITY.md) · [GOVERNANCE.md](./GOVERNANCE.md) 
 
 ## Contributing / support
 
-Issues and PRs welcome on [vk-ai/pg-governance-agent](https://github.com/vk-ai/pg-governance-agent). Start with the docs table above before changing policy or MCP tools.
+Contributions are welcome — new here? Start with a
+[**good first issue**](https://github.com/vk-ai/pg-governance-agent/labels/good%20first%20issue) or
+[**help wanted**](https://github.com/vk-ai/pg-governance-agent/labels/help%20wanted).
+
+| Doc | Purpose |
+|-----|---------|
+| [CONTRIBUTING.md](./CONTRIBUTING.md) | Setup (Node 20), tests incl. live Postgres 17, branch/PR flow, coding standards |
+| [CODE_OF_CONDUCT.md](./CODE_OF_CONDUCT.md) | Contributor Covenant 2.1 |
+| [SECURITY.md](./SECURITY.md) | Threat model; report vulnerabilities via [private advisories](https://github.com/vk-ai/pg-governance-agent/security/advisories/new) |
+| [Issue templates](./.github/ISSUE_TEMPLATE) / [PR template](./.github/PULL_REQUEST_TEMPLATE.md) | What to include |
+
+Quick start for contributors: `npm ci && npm test && npm run build`. Please read the docs table above before changing policy or MCP tools.
