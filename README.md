@@ -163,7 +163,7 @@ If you want a disposable local Postgres + Vault (Rancher Desktop / Docker):
 ```bash
 cp .env.example .env
 npm install && npm test && npm run policy:check
-docker compose up -d          # postgres:16 + vault + vault-init
+docker compose up -d          # postgres:17 + vault + vault-init
 npm run build && npm run mcp
 ```
 

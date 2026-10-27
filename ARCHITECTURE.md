@@ -31,7 +31,7 @@ PgGuard is a **governance MCP server** that sits between an AI client (e.g. Curs
 | Secrets | `src/secrets/` | Vault KV v2 or env fallback |
 | DB access | `src/db/` | `pg` pool, introspection helpers |
 | Audit | `src/audit/` | Append-only JSONL under `data/audit/` |
-| Compose stack | `docker-compose.yml` | Postgres 16 + Vault 1.15 (dev) + init |
+| Compose stack | `docker-compose.yml` | Postgres 17 + Vault 1.15 (dev) + init |
 
 ## Data flow
 
